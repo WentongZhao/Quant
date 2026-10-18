@@ -39,6 +39,7 @@ run_one_setting() {
         --data "${data}" \
         --method smoothquant \
         --sq_target vision \
+        --sq_a_asym --no-sq_w_asym \
         --alpha "${SQ_ALPHA}" \
         --sq_scale_mode "${SQ_SCALE_MODE}" \
         --w_bit "${w_bit}" --a_bit "${a_bit}" --k_bit 16 --v_bit 16 \
@@ -56,6 +57,7 @@ run_one_setting() {
         --data "${data}" \
         --method smoothquant \
         --sq_target vision \
+        --sq_a_asym --no-sq_w_asym \
         --alpha "${SQ_ALPHA}" \
         --sq_scale_mode "${SQ_SCALE_MODE}" \
         --w_bit "${w_bit}" --a_bit "${a_bit}" --k_bit 16 --v_bit 16 \

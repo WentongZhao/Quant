@@ -1,0 +1,769 @@
+diff --git a/src/openvla/experiments/robot/libero/libero_utils.py b/src/openvla/experiments/robot/libero/libero_utils.py
+index d631caa..017f02c 100644
+--- a/src/openvla/experiments/robot/libero/libero_utils.py
++++ b/src/openvla/experiments/robot/libero/libero_utils.py
+@@ -71,10 +71,14 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
+     start_hm = RUN_START_HM
+     # Place config suffix after start time segment if provided
+     time_segment = start_hm if not config_suffix else f"{start_hm}_{config_suffix}"
+-    rollout_dir = f"./rollouts_dev/{DATE}/{time_segment}/{processed_task_description}_{idx}_{result_tag}"
++    rollout_root = os.environ.get("ROLLOUT_ROOT", "./rollouts_dev")
++    rollout_dir = os.path.join(rollout_root, DATE, time_segment, f"{processed_task_description}_{idx}_{result_tag}")
+     os.makedirs(rollout_dir, exist_ok=True)
+-    
+-    mp4_path = f"{rollout_dir}/{view}--{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}"
++
++    mp4_path = os.path.join(
++        rollout_dir,
++        f"{view}--{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}",
++    )
+     if notes is not None and len(notes) > 0:
+         # Avoid spaces in filenames
+         safe_notes = notes.replace(" ", "_")
+@@ -83,7 +87,15 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
+     
+     video_writer = imageio.get_writer(mp4_path, fps=30)
+     for img in rollout_images:
+-        video_writer.append_data(img)
++        # imageio expects HxWxC numpy arrays; normalize common input types (e.g., PIL.Image).
++        frame = img if isinstance(img, np.ndarray) else np.asarray(img)
++        if frame.ndim == 2:
++            frame = np.stack([frame, frame, frame], axis=-1)
++        if frame.ndim == 3 and frame.shape[-1] == 4:
++            frame = frame[..., :3]
++        if frame.dtype != np.uint8:
++            frame = np.clip(frame, 0, 255).astype(np.uint8)
++        video_writer.append_data(frame)
+     video_writer.close()
+     print(f"Saved rollout MP4 at path {mp4_path}")
+     if log_file is not None:
+diff --git a/src/openvla/experiments/robot/libero/run_libero_eval.py b/src/openvla/experiments/robot/libero/run_libero_eval.py
+index cc56206..b081b33 100755
+--- a/src/openvla/experiments/robot/libero/run_libero_eval.py
++++ b/src/openvla/experiments/robot/libero/run_libero_eval.py
+@@ -3,6 +3,7 @@ run_libero_eval.py
+ Runs a model in a LIBERO simulation environment.
+ """
+ 
++import json
+ import os
+ import sys
+ from PIL import Image
+@@ -82,6 +83,7 @@ class GenerateConfig:
+     #################################################################################################################
+     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
+     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
++    summary_json: Optional[str] = None               # Optional path to dump structured eval summary (JSON)
+ 
+     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
+     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
+@@ -146,15 +148,28 @@ def eval_libero(cfg: GenerateConfig) -> None:
+     resize_size = get_image_resize_size(cfg)
+     # Start evaluation
+     total_episodes, total_successes = 0, 0
++    total_inferences = 0
++    task_summary_rows = []
+     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+         # Get task
+         task = task_suite.get_task(task_id)
+         # Get default LIBERO initial states
+         initial_states = task_suite.get_task_init_states(task_id)
++        num_initial_states = len(initial_states)
++        if num_initial_states == 0:
++            raise RuntimeError(f"Task {task_id} has zero initial states; cannot run evaluation.")
++        if cfg.num_trials_per_task > num_initial_states:
++            msg = (
++                f"[WARN] Task {task_id} has only {num_initial_states} init states but "
++                f"num_trials_per_task={cfg.num_trials_per_task}. Reusing init states with modulo indexing."
++            )
++            print(msg)
++            log_file.write(msg + "\n")
+         # Initialize LIBERO environment and task description
+         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+         # Start episodes
+         task_episodes, task_successes = 0, 0
++        task_inferences = 0
+         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+             print(f"\nTask: {task_description}")
+             log_file.write(f"\nTask: {task_description}\n")
+@@ -162,9 +177,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
+             env.reset()
+             model.reset_av_history()
+             # Set initial states
+-            obs = env.set_init_state(initial_states[episode_idx])
++            init_state_idx = episode_idx % num_initial_states
++            obs = env.set_init_state(initial_states[init_state_idx])
+             # Setup
+             t = 0
++            episode_inferences = 0
+             replay_images = []
+             replay_images_heatmap = []
+             prev_img = None
+@@ -215,6 +232,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
+                         processor=processor,
+                         last_caches=last_caches,
+                     )
++                    episode_inferences += 1
+                     replay_images_heatmap.append(result_image)
+                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
+                     action = normalize_gripper_action(action, binarize=True)
+@@ -231,6 +249,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
+                     t += 1
+             task_episodes += 1
+             total_episodes += 1
++            task_inferences += episode_inferences
++            total_inferences += episode_inferences
+ 
+             save_rollout_video(
+                         replay_images_heatmap, total_episodes, success=done, task_description=task_description, log_file=log_file
+@@ -240,16 +260,47 @@ def eval_libero(cfg: GenerateConfig) -> None:
+             print(f"Success: {done}")
+             print(f"# episodes completed so far: {total_episodes}")
+             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
++            print(f"# policy inferences this episode: {episode_inferences}")
+             log_file.write(f"Success: {done}\n")
+             log_file.write(f"# episodes completed so far: {total_episodes}\n")
+             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
++            log_file.write(f"# policy inferences this episode: {episode_inferences}\n")
+             log_file.flush()
+         # Log final results
+         print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+         print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
++        print(
++            f"Current task inferences: {task_inferences} "
++            f"(avg {float(task_inferences) / float(task_episodes):.2f} per episode)"
++        )
++        print(
++            f"Current total inferences: {total_inferences} "
++            f"(avg {float(total_inferences) / float(total_episodes):.2f} per episode)"
++        )
+         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
+         log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
++        log_file.write(
++            f"Current task inferences: {task_inferences} "
++            f"(avg {float(task_inferences) / float(task_episodes):.2f} per episode)\n"
++        )
++        log_file.write(
++            f"Current total inferences: {total_inferences} "
++            f"(avg {float(total_inferences) / float(total_episodes):.2f} per episode)\n"
++        )
+         log_file.flush()
++
++        task_summary_rows.append(
++            {
++                "task_id": int(task_id),
++                "task_description": str(task_description),
++                "episodes": int(task_episodes),
++                "successes": int(task_successes),
++                "success_rate": float(task_successes) / float(task_episodes),
++                "inferences": int(task_inferences),
++                "avg_inferences_per_episode": float(task_inferences) / float(task_episodes),
++            }
++        )
++
+         if cfg.use_wandb:
+             wandb.log(
+                 {
+@@ -257,6 +308,52 @@ def eval_libero(cfg: GenerateConfig) -> None:
+                     f"num_episodes/{task_description}": task_episodes,
+                 }
+             )
++
++    print("\n================ Inference Summary ================")
++    log_file.write("\n================ Inference Summary ================\n")
++    print(f"{'task_id':>7}  {'episodes':>8}  {'inferences':>11}  {'avg_inf/ep':>10}  task")
++    log_file.write(f"{'task_id':>7}  {'episodes':>8}  {'inferences':>11}  {'avg_inf/ep':>10}  task\n")
++    for row in task_summary_rows:
++        line = (
++            f"{row['task_id']:7d}  "
++            f"{row['episodes']:8d}  "
++            f"{row['inferences']:11d}  "
++            f"{row['avg_inferences_per_episode']:10.2f}  "
++            f"{row['task_description']}"
++        )
++        print(line)
++        log_file.write(line + "\n")
++
++    total_avg_inferences = float(total_inferences) / float(total_episodes)
++    total_success_rate = float(total_successes) / float(total_episodes)
++    final_line = (
++        f"[Final] Total policy inferences: {total_inferences} "
++        f"(avg {total_avg_inferences:.2f} per episode)"
++    )
++    print(final_line)
++    log_file.write(final_line + "\n")
++
++    if cfg.summary_json:
++        summary_dir = os.path.dirname(cfg.summary_json)
++        if summary_dir:
++            os.makedirs(summary_dir, exist_ok=True)
++        summary_payload = {
++            "task_suite_name": cfg.task_suite_name,
++            "num_tasks": int(num_tasks_in_suite),
++            "num_trials_per_task": int(cfg.num_trials_per_task),
++            "total_episodes": int(total_episodes),
++            "total_successes": int(total_successes),
++            "total_success_rate": float(total_success_rate),
++            "total_inferences": int(total_inferences),
++            "avg_inferences_per_episode": float(total_avg_inferences),
++            "run_id_note": cfg.run_id_note,
++            "local_log_filepath": local_log_filepath,
++            "tasks": task_summary_rows,
++        }
++        with open(cfg.summary_json, "w", encoding="utf-8") as f:
++            json.dump(summary_payload, f, indent=2, ensure_ascii=False)
++        print(f"[Summary JSON] {cfg.summary_json}")
++        log_file.write(f"[Summary JSON] {cfg.summary_json}\n")
+     # Save local log file
+     log_file.close()
+     # Push total metrics and local log file to wandb
+diff --git a/src/openvla/experiments/robot/openvla_utils.py b/src/openvla/experiments/robot/openvla_utils.py
+index 39bd885..8fb9008 100644
+--- a/src/openvla/experiments/robot/openvla_utils.py
++++ b/src/openvla/experiments/robot/openvla_utils.py
+@@ -31,6 +31,23 @@ DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
+ DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+ np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+ 
++
++def _configure_tensorflow_runtime_for_eval() -> None:
++    """Prevent TensorFlow from pre-allocating CUDA memory needed by PyTorch."""
++    try:
++        tf.config.set_visible_devices([], "GPU")
++    except Exception:
++        # If TF runtime is already initialized, fall back to memory-growth mode.
++        try:
++            for gpu in tf.config.list_physical_devices("GPU"):
++                tf.config.experimental.set_memory_growth(gpu, True)
++        except Exception:
++            pass
++
++
++_configure_tensorflow_runtime_for_eval()
++
++
+ # Initialize system prompt for OpenVLA v0.1.
+ OPENVLA_V01_SYSTEM_PROMPT = (
+     "A chat between a curious user and an artificial intelligence assistant. "
+@@ -339,8 +356,8 @@ def get_vla(cfg):
+ def get_processor(cfg):
+     """Get VLA model's Hugging Face processor."""
+     from transformers import AutoProcessor
+-    
+-    # Try local loading first, fallback to network if failed
++
++    # Strict local-only loading for reproducible offline eval.
+     try:
+         processor = AutoProcessor.from_pretrained(
+             cfg.pretrained_checkpoint, 
+@@ -349,13 +366,12 @@ def get_processor(cfg):
+         )
+         print(f"[*] Using LOCAL processor: {type(processor).__name__}")
+     except Exception as e:
+-        print(f"[*] Local loading failed, trying with network: {e}")
+-        processor = AutoProcessor.from_pretrained(
+-            cfg.pretrained_checkpoint, 
+-            trust_remote_code=True
+-        )
+-        print(f"[*] Using NETWORK processor: {type(processor).__name__}")
+-    
++        raise RuntimeError(
++            "Failed to load processor from local checkpoint. "
++            "Please verify tokenizer/processor files exist under "
++            f"{cfg.pretrained_checkpoint!r} (e.g. preprocessor_config.json, tokenizer.json, tokenizer_config.json)."
++        ) from e
++
+     return processor
+ 
+ 
+diff --git a/src/openvla/pyproject.toml b/src/openvla/pyproject.toml
+index ade1284..a2669ef 100644
+--- a/src/openvla/pyproject.toml
++++ b/src/openvla/pyproject.toml
+@@ -34,6 +34,7 @@ dependencies = [
+     # "flash_attn==2.5.5",      # Here for documentation -- install *AFTER* editable install (follow README)
+     "huggingface_hub",
+     "json-numpy",
++    "numpy<2.0",
+     "jsonlines",
+     "matplotlib",
+     "peft==0.11.1",
+diff --git a/src/openvla/vla_pruner_srcipts/run_vla_pruner/run_oft_libero_spatial.sh b/src/openvla/vla_pruner_srcipts/run_vla_pruner/run_oft_libero_spatial.sh
+new file mode 100755
+index 0000000..d6f66a4
+--- /dev/null
++++ b/src/openvla/vla_pruner_srcipts/run_vla_pruner/run_oft_libero_spatial.sh
+@@ -0,0 +1,473 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Independent VLA-Pruner evaluation script for OFT LIBERO-Spatial checkpoint.
++# This script does NOT depend on or modify SimplerEnv/openvla-oft/quant.sh.
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++OPENVLA_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
++cd "${OPENVLA_DIR}"
++WORKSPACE_DIR="$(cd "${OPENVLA_DIR}/../../.." && pwd)"
++OPENVLA_OFT_DIR_CANDIDATE="${WORKSPACE_DIR}/openvla-oft"
++LOCAL_TRANSFORMERS_SRC="${OPENVLA_DIR}/transformers/src"
++
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
++export CUDA_DEVICE_ORDER=PCI_BUS_ID
++export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
++export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
++# Enforce offline/local-only loading by default; set to 0 explicitly if network loading is desired.
++export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
++export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
++export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
++# Use repo-local LIBERO config to avoid cross-env path contamination from ~/.libero/config.yaml.
++export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${OPENVLA_DIR}/.libero}"
++
++CHECKPOINT_COMPAT_DEFAULT="${CHECKPOINT_COMPAT_DEFAULT:-/data5/cgk_lyy_0/models/openvla-7b-finetuned-libero-spatial}"
++CHECKPOINT="${CHECKPOINT:-${CHECKPOINT_COMPAT_DEFAULT}}"
++CHECKPOINT_FALLBACK="${CHECKPOINT_FALLBACK:-${CHECKPOINT_COMPAT_DEFAULT}}"
++TASK_SUITE_NAME="${TASK_SUITE_NAME:-libero_spatial}"
++# Reduce default rollout count for faster iteration.
++# Override via: NUM_TRIALS_PER_TASK=50 bash run_oft_libero_spatial.sh
++NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-20}"
++SEED="${SEED:-7}"
++if [[ -d "${OPENVLA_OFT_DIR_CANDIDATE}" ]]; then
++    OPENVLA_OFT_DIR="${OPENVLA_OFT_DIR:-${OPENVLA_OFT_DIR_CANDIDATE}}"
++else
++    OPENVLA_OFT_DIR="${OPENVLA_OFT_DIR:-${OPENVLA_DIR}}"
++fi
++LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${OPENVLA_OFT_DIR}/experiments/logs}"
++SUMMARY_DIR="${SUMMARY_DIR:-${LOCAL_LOG_DIR}/inference_summaries}"
++export ROLLOUT_ROOT="${ROLLOUT_ROOT:-${OPENVLA_OFT_DIR}/rollouts_dev}"
++OFT_STRICT_COMPAT="${OFT_STRICT_COMPAT:-1}"
++AUTO_SWITCH_TO_COMPAT="${AUTO_SWITCH_TO_COMPAT:-1}"
++FORCE_INCOMPATIBLE_OFT="${FORCE_INCOMPATIBLE_OFT:-0}"
++LOAD_IN_8BIT="${LOAD_IN_8BIT:-False}"
++LOAD_IN_4BIT="${LOAD_IN_4BIT:-False}"
++MIN_FREE_GB="${MIN_FREE_GB:-20}"
++export MIN_FREE_GB
++USE_LOCAL_FASTV_TRANSFORMERS="${USE_LOCAL_FASTV_TRANSFORMERS:-1}"
++FASTV_STRICT="${FASTV_STRICT:-1}"
++
++# all | baseline | fastv | pruner
++MODE="${MODE:-all}"
++
++# space-separated list, e.g. "0.875 0.75 0.5"
++FASTV_RS="${FASTV_RS:-0.875 0.75 0.5}"
++
++# fastv | prefill
++PRUNER_SELECTOR="${PRUNER_SELECTOR:-fastv}"
++
++read -r -a FASTV_R_LIST <<< "${FASTV_RS}"
++declare -a TIMING_LINES=()
++declare -a SUMMARY_RECORDS=()
++SCRIPT_START_TS="$(date +%s)"
++
++if [[ ! -d "${CHECKPOINT}" ]]; then
++    echo "[ERROR] CHECKPOINT does not exist: ${CHECKPOINT}"
++    exit 1
++fi
++
++if [[ "${PRUNER_SELECTOR}" != "fastv" && "${PRUNER_SELECTOR}" != "prefill" ]]; then
++    echo "[ERROR] PRUNER_SELECTOR must be one of: fastv, prefill"
++    exit 1
++fi
++
++if [[ "${USE_LOCAL_FASTV_TRANSFORMERS}" == "1" ]]; then
++    if [[ ! -d "${LOCAL_TRANSFORMERS_SRC}" ]]; then
++        echo "[ERROR] Local transformers source not found: ${LOCAL_TRANSFORMERS_SRC}"
++        exit 1
++    fi
++    export PYTHONPATH="${LOCAL_TRANSFORMERS_SRC}:${PYTHONPATH:-}"
++fi
++
++if [[ "${LOAD_IN_8BIT}" == "True" && "${LOAD_IN_4BIT}" == "True" ]]; then
++    echo "[ERROR] LOAD_IN_8BIT and LOAD_IN_4BIT cannot both be True."
++    exit 1
++fi
++
++check_oft_checkpoint_compat() {
++    local has_action_head=0
++    local has_proprio_projector=0
++    local has_noisy_action_projector=0
++
++    if find "${CHECKPOINT}" -maxdepth 1 -type f -name "action_head*checkpoint*" | grep -q .; then
++        has_action_head=1
++    fi
++    if find "${CHECKPOINT}" -maxdepth 1 -type f -name "proprio_projector*checkpoint*" | grep -q .; then
++        has_proprio_projector=1
++    fi
++    if find "${CHECKPOINT}" -maxdepth 1 -type f -name "noisy_action_projector*checkpoint*" | grep -q .; then
++        has_noisy_action_projector=1
++    fi
++
++    if [[ "${has_action_head}" == "1" || "${has_proprio_projector}" == "1" || "${has_noisy_action_projector}" == "1" ]]; then
++        echo "[WARN] Detected OFT sidecar checkpoints under ${CHECKPOINT}:"
++        echo "       action_head=${has_action_head}, proprio_projector=${has_proprio_projector}, noisy_action_projector=${has_noisy_action_projector}"
++        echo "[WARN] Current VLA-Pruner eval entry (experiments/robot/libero/run_libero_eval.py)"
++        echo "       does not load OFT sidecar modules, which often leads to near-zero success."
++        if [[ "${AUTO_SWITCH_TO_COMPAT}" == "1" && "${CHECKPOINT}" != "${CHECKPOINT_FALLBACK}" && -d "${CHECKPOINT_FALLBACK}" ]]; then
++            echo "[INFO] Auto-switching to VLA-Pruner compatible checkpoint:"
++            echo "       ${CHECKPOINT_FALLBACK}"
++            CHECKPOINT="${CHECKPOINT_FALLBACK}"
++        elif [[ "${FORCE_INCOMPATIBLE_OFT}" == "1" ]]; then
++            echo "[WARN] Continuing with likely-incompatible OFT checkpoint."
++            echo "[WARN] This may produce all-fail episodes (220 steps each)."
++        else
++            echo "[ERROR] Refusing to run with likely-incompatible OFT checkpoint."
++            echo "[HINT] Use a non-OFT checkpoint for this entry, e.g.:"
++            echo "       CHECKPOINT=${CHECKPOINT_COMPAT_DEFAULT}"
++            echo "[HINT] Or enable auto switch/fallback:"
++            echo "       AUTO_SWITCH_TO_COMPAT=1 CHECKPOINT_FALLBACK=${CHECKPOINT_COMPAT_DEFAULT}"
++            echo "[HINT] If you still want to force this run:"
++            echo "       FORCE_INCOMPATIBLE_OFT=1"
++            exit 1
++        fi
++    fi
++}
++
++format_duration() {
++    local total_sec="$1"
++    printf "%02d:%02d:%02d" $((total_sec / 3600)) $(((total_sec % 3600) / 60)) $((total_sec % 60))
++}
++
++sanitize_id() {
++    local raw="$1"
++    raw="${raw// /_}"
++    raw="${raw//\//_}"
++    raw="${raw//:/_}"
++    raw="${raw//\%/pct}"
++    raw="${raw//\./_}"
++    echo "${raw}"
++}
++
++append_timing() {
++    local run_label="$1"
++    local elapsed_sec="$2"
++    TIMING_LINES+=("${run_label}|${elapsed_sec}")
++}
++
++append_summary_record() {
++    local run_label="$1"
++    local summary_json="$2"
++    SUMMARY_RECORDS+=("${run_label}|${summary_json}")
++}
++
++print_inference_summary() {
++    if [[ "${#SUMMARY_RECORDS[@]}" -eq 0 ]]; then
++        return 0
++    fi
++
++    echo
++    echo "================ Inference Comparison ================"
++    printf "%-42s %-12s %-10s %-12s\n" "run" "inferences" "episodes" "avg_inf/ep"
++
++    for record in "${SUMMARY_RECORDS[@]}"; do
++        local run_label summary_json
++        IFS='|' read -r run_label summary_json <<< "${record}"
++        if [[ ! -f "${summary_json}" ]]; then
++            printf "%-42s %-12s %-10s %-12s\n" "${run_label}" "NA" "NA" "NA"
++            continue
++        fi
++        python - <<PY
++import json
++run_label = ${run_label@Q}
++summary_json = ${summary_json@Q}
++with open(summary_json, "r", encoding="utf-8") as f:
++    d = json.load(f)
++print(f"{run_label:<42} {d['total_inferences']:<12} {d['total_episodes']:<10} {d['avg_inferences_per_episode']:<12.2f}")
++PY
++    done
++    echo "======================================================"
++
++    for record in "${SUMMARY_RECORDS[@]}"; do
++        local run_label summary_json
++        IFS='|' read -r run_label summary_json <<< "${record}"
++        if [[ ! -f "${summary_json}" ]]; then
++            continue
++        fi
++        echo
++        echo "---- Task Avg Inferences: ${run_label} ----"
++        python - <<PY
++import json
++summary_json = ${summary_json@Q}
++with open(summary_json, "r", encoding="utf-8") as f:
++    d = json.load(f)
++for row in d["tasks"]:
++    print(f"task_{row['task_id']:02d}  avg_inf/ep={row['avg_inferences_per_episode']:.2f}  inferences={row['inferences']}  episodes={row['episodes']}  {row['task_description']}")
++PY
++    done
++}
++
++print_timing_summary() {
++    if [[ "${#TIMING_LINES[@]}" -eq 0 ]]; then
++        return 0
++    fi
++
++    echo
++    echo "================ Runtime Summary ================"
++    printf "%-42s %-12s\n" "run" "elapsed"
++    for record in "${TIMING_LINES[@]}"; do
++        local run_label elapsed_sec
++        IFS='|' read -r run_label elapsed_sec <<< "${record}"
++        printf "%-42s %-12s\n" "${run_label}" "$(format_duration "${elapsed_sec}")"
++    done
++    local total_elapsed
++    total_elapsed="$(( $(date +%s) - SCRIPT_START_TS ))"
++    echo "-------------------------------------------------"
++    printf "%-42s %-12s\n" "script_total" "$(format_duration "${total_elapsed}")"
++    echo "================================================="
++}
++
++echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
++echo "[INFO] CHECKPOINT=${CHECKPOINT}"
++echo "[INFO] CHECKPOINT_COMPAT_DEFAULT=${CHECKPOINT_COMPAT_DEFAULT}"
++echo "[INFO] CHECKPOINT_FALLBACK=${CHECKPOINT_FALLBACK}, AUTO_SWITCH_TO_COMPAT=${AUTO_SWITCH_TO_COMPAT}"
++echo "[INFO] OPENVLA_OFT_DIR=${OPENVLA_OFT_DIR}"
++echo "[INFO] LOCAL_LOG_DIR=${LOCAL_LOG_DIR}"
++echo "[INFO] ROLLOUT_ROOT=${ROLLOUT_ROOT}"
++echo "[INFO] USE_LOCAL_FASTV_TRANSFORMERS=${USE_LOCAL_FASTV_TRANSFORMERS}, FASTV_STRICT=${FASTV_STRICT}"
++echo "[INFO] LOCAL_TRANSFORMERS_SRC=${LOCAL_TRANSFORMERS_SRC}"
++echo "[INFO] LOAD_IN_8BIT=${LOAD_IN_8BIT}, LOAD_IN_4BIT=${LOAD_IN_4BIT}, MIN_FREE_GB=${MIN_FREE_GB}"
++echo "[INFO] HF_HUB_OFFLINE=${HF_HUB_OFFLINE}, TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE}, HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE}"
++echo "[INFO] LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH}"
++echo "[INFO] MODE=${MODE}, TASK_SUITE_NAME=${TASK_SUITE_NAME}, NUM_TRIALS_PER_TASK=${NUM_TRIALS_PER_TASK}"
++
++python - <<'PY'
++import os
++from pathlib import Path
++import libero
++
++benchmark_root = (Path(libero.__file__).resolve().parent / "libero").resolve()
++cfg_dir = Path(os.environ["LIBERO_CONFIG_PATH"]).expanduser()
++cfg_dir.mkdir(parents=True, exist_ok=True)
++config_path = cfg_dir / "config.yaml"
++
++path_map = {
++    "benchmark_root": benchmark_root,
++    "bddl_files": benchmark_root / "bddl_files",
++    "init_states": benchmark_root / "init_files",
++    "datasets": (benchmark_root / "../datasets").resolve(),
++    "assets": benchmark_root / "assets",
++}
++with open(config_path, "w", encoding="utf-8") as f:
++    for key in ["benchmark_root", "bddl_files", "init_states", "datasets", "assets"]:
++        f.write(f"{key}: {path_map[key]}\n")
++
++print(f"[INFO] LIBERO benchmark_root={benchmark_root}")
++print(f"[INFO] LIBERO config={config_path}")
++PY
++
++check_oft_checkpoint_compat
++echo "[INFO] Effective CHECKPOINT=${CHECKPOINT}"
++
++REQUIRE_FASTV="0"
++if [[ "${MODE}" == "fastv" || "${MODE}" == "pruner" || "${MODE}" == "all" ]]; then
++    REQUIRE_FASTV="1"
++fi
++export REQUIRE_FASTV FASTV_STRICT
++
++python - <<'PY'
++import os
++import sys
++
++def parse_semver(version: str):
++    parts = []
++    for chunk in version.split("."):
++        num = ""
++        for ch in chunk:
++            if ch.isdigit():
++                num += ch
++            else:
++                break
++        parts.append(int(num or "0"))
++    while len(parts) < 3:
++        parts.append(0)
++    return tuple(parts[:3])
++
++require_fastv = os.getenv("REQUIRE_FASTV", "0") == "1"
++fastv_strict = os.getenv("FASTV_STRICT", "1") == "1"
++use_local = os.getenv("USE_LOCAL_FASTV_TRANSFORMERS", "1") == "1"
++
++import tokenizers
++tokenizers_ver = tokenizers.__version__
++print(f"[INFO] tokenizers={tokenizers_ver}")
++
++if require_fastv and use_local and parse_semver(tokenizers_ver) >= (0, 19, 0):
++    raise SystemExit(
++        "[ERROR] FastV requires local transformers with tokenizers<0.19, "
++        f"but found tokenizers=={tokenizers_ver}. "
++        "Run: conda run -n openvla-oft-118 pip install 'tokenizers>=0.14,<0.19'"
++    )
++
++import transformers
++print(f"[INFO] transformers={transformers.__version__} ({transformers.__file__})")
++
++if require_fastv:
++    from transformers.models.llama.modeling_llama import LlamaForCausalLM
++    has_fastv = hasattr(LlamaForCausalLM, "fastv_forward")
++    print(f"[INFO] LlamaForCausalLM.fastv_forward={has_fastv}")
++    if not has_fastv and fastv_strict:
++        raise SystemExit(
++            "[ERROR] FastV requested but fastv_forward is missing. "
++            "Likely loading wrong transformers package."
++        )
++PY
++
++python - <<'PY'
++import os
++import torch
++
++if not torch.cuda.is_available():
++    raise SystemExit("[ERROR] CUDA is not available in this environment.")
++if torch.cuda.device_count() < 1:
++    raise SystemExit("[ERROR] No CUDA device is visible to torch.")
++
++props = torch.cuda.get_device_properties(0)
++total_gb = props.total_memory / (1024 ** 3)
++print(f"[INFO] torch device[0]: {props.name}, total_memory={total_gb:.2f} GiB")
++
++# 24GB-class sanity check to avoid accidentally running on a 20GB card.
++if props.total_memory < 22 * (1024 ** 3):
++    raise SystemExit(
++        "[ERROR] Detected <22GiB VRAM on torch device[0]. "
++        "This is likely not the intended 24GB GPU; aborting to avoid OOM."
++    )
++
++free_bytes, total_bytes = torch.cuda.mem_get_info(0)
++free_gb = free_bytes / (1024 ** 3)
++min_free_gb_raw = os.getenv("MIN_FREE_GB", "20")
++try:
++    min_free_gb = float(min_free_gb_raw)
++except ValueError:
++    raise SystemExit(f"[ERROR] MIN_FREE_GB must be a number, got: {min_free_gb_raw!r}")
++print(f"[INFO] torch device[0] free_memory={free_gb:.2f} GiB")
++if free_gb < min_free_gb:
++    raise SystemExit(
++        f"[ERROR] Free VRAM ({free_gb:.2f} GiB) < MIN_FREE_GB ({min_free_gb:.2f} GiB). "
++        "Another process is occupying this GPU; stop it or pick another GPU."
++    )
++PY
++
++run_baseline() {
++    echo "[INFO] Running baseline (no pruning)..."
++    local t0 t1 elapsed summary_json
++    mkdir -p "${LOCAL_LOG_DIR}" "${SUMMARY_DIR}" "${ROLLOUT_ROOT}"
++    mkdir -p "${SUMMARY_DIR}"
++    summary_json="${SUMMARY_DIR}/$(sanitize_id "oft_baseline").json"
++    t0="$(date +%s)"
++    python experiments/robot/libero/run_libero_eval.py \
++        --pretrained_checkpoint "${CHECKPOINT}" \
++        --task_suite_name "${TASK_SUITE_NAME}" \
++        --load_in_8bit "${LOAD_IN_8BIT}" \
++        --load_in_4bit "${LOAD_IN_4BIT}" \
++        --use_fastv False \
++        --seed "${SEED}" \
++        --run_id_note "oft_baseline" \
++        --local_log_dir "${LOCAL_LOG_DIR}" \
++        --summary_json "${summary_json}" \
++        --num_trials_per_task "${NUM_TRIALS_PER_TASK}"
++    t1="$(date +%s)"
++    elapsed="$((t1 - t0))"
++    append_timing "baseline" "${elapsed}"
++    append_summary_record "baseline" "${summary_json}"
++}
++
++run_fastv() {
++    mkdir -p "${LOCAL_LOG_DIR}" "${SUMMARY_DIR}" "${ROLLOUT_ROOT}"
++    for r in "${FASTV_R_LIST[@]}"; do
++        local retain t0 t1 elapsed summary_json run_label
++        retain="$(python - <<PY
++r = float("${r}")
++print(f"{(1.0 - r) * 100:.1f}")
++PY
++)"
++        run_label="fastv_r=${r} (retain ${retain}%)"
++        summary_json="${SUMMARY_DIR}/$(sanitize_id "oft_fastv_r_${r}_retain_${retain}").json"
++        echo "[INFO] Running FastV (temporal=False), fastv_r=${r} (retain ${retain}%)..."
++        t0="$(date +%s)"
++        python experiments/robot/libero/run_libero_eval.py \
++            --pretrained_checkpoint "${CHECKPOINT}" \
++            --task_suite_name "${TASK_SUITE_NAME}" \
++            --load_in_8bit "${LOAD_IN_8BIT}" \
++            --load_in_4bit "${LOAD_IN_4BIT}" \
++            --use_text_vision_selection False \
++            --use_temporal False \
++            --use_fastv True \
++            --fastv_r "${r}" \
++            --seed "${SEED}" \
++            --run_id_note "oft_fastv_retain_${retain}" \
++            --local_log_dir "${LOCAL_LOG_DIR}" \
++            --summary_json "${summary_json}" \
++            --num_trials_per_task "${NUM_TRIALS_PER_TASK}"
++        t1="$(date +%s)"
++        elapsed="$((t1 - t0))"
++        append_timing "${run_label}" "${elapsed}"
++        append_summary_record "${run_label}" "${summary_json}"
++    done
++}
++
++run_pruner() {
++    local use_prefill="False"
++    local selector_tag="fastvsel"
++    mkdir -p "${LOCAL_LOG_DIR}" "${SUMMARY_DIR}" "${ROLLOUT_ROOT}"
++    if [[ "${PRUNER_SELECTOR}" == "prefill" ]]; then
++        use_prefill="True"
++        selector_tag="prefill"
++    fi
++
++    for r in "${FASTV_R_LIST[@]}"; do
++        local retain t0 t1 elapsed summary_json run_label
++        retain="$(python - <<PY
++r = float("${r}")
++print(f"{(1.0 - r) * 100:.1f}")
++PY
++)"
++        run_label="pruner_${selector_tag}_r=${r} (retain ${retain}%)"
++        summary_json="${SUMMARY_DIR}/$(sanitize_id "oft_pruner_${selector_tag}_r_${r}_retain_${retain}").json"
++        echo "[INFO] Running VLA-Pruner (${selector_tag}), fastv_r=${r} (retain ${retain}%)..."
++        t0="$(date +%s)"
++        python experiments/robot/libero/run_libero_eval.py \
++            --pretrained_checkpoint "${CHECKPOINT}" \
++            --task_suite_name "${TASK_SUITE_NAME}" \
++            --load_in_8bit "${LOAD_IN_8BIT}" \
++            --load_in_4bit "${LOAD_IN_4BIT}" \
++            --use_text_vision_selection False \
++            --use_prefil_attention "${use_prefill}" \
++            --use_temporal True \
++            --use_fastv True \
++            --fastv_r "${r}" \
++            --seed "${SEED}" \
++            --run_id_note "oft_vlapruner_${selector_tag}_retain_${retain}" \
++            --local_log_dir "${LOCAL_LOG_DIR}" \
++            --summary_json "${summary_json}" \
++            --num_trials_per_task "${NUM_TRIALS_PER_TASK}"
++        t1="$(date +%s)"
++        elapsed="$((t1 - t0))"
++        append_timing "${run_label}" "${elapsed}"
++        append_summary_record "${run_label}" "${summary_json}"
++    done
++}
++
++case "${MODE}" in
++    baseline)
++        run_baseline
++        ;;
++    fastv)
++        run_fastv
++        ;;
++    pruner)
++        run_pruner
++        ;;
++    all)
++        run_baseline
++        run_fastv
++        run_pruner
++        ;;
++    *)
++        echo "[ERROR] MODE must be one of: all, baseline, fastv, pruner"
++        exit 1
++        ;;
++esac
++
++print_timing_summary
++print_inference_summary

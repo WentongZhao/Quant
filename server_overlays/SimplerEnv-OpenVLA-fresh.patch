@@ -1,0 +1,784 @@
+diff --git a/simpler_env/evaluation/maniskill2_evaluator.py b/simpler_env/evaluation/maniskill2_evaluator.py
+index a824479..b75d159 100644
+--- a/simpler_env/evaluation/maniskill2_evaluator.py
++++ b/simpler_env/evaluation/maniskill2_evaluator.py
+@@ -113,7 +113,16 @@ def run_maniskill2_eval_single_episode(
+     task_descriptions = []
+     while not (predicted_terminated or truncated):
+         # step the model; "raw_action" is raw model action output; "action" is the processed action to be sent into maniskill env
+-        raw_action, action = model.step(image, task_description, eef_pos=obs["agent"]["eef_pos"])
++        step_call_kwargs = {}
++        if isinstance(obs, dict):
++            agent_obs = obs.get("agent")
++            if isinstance(agent_obs, dict) and "eef_pos" in agent_obs:
++                step_call_kwargs["eef_pos"] = agent_obs["eef_pos"]
++
++        if step_call_kwargs:
++            raw_action, action = model.step(image, task_description, **step_call_kwargs)
++        else:
++            raw_action, action = model.step(image, task_description)
+         predicted_actions.append(raw_action)
+         predicted_terminated = bool(action["terminate_episode"][0] > 0)
+         if predicted_terminated:
+diff --git a/main_quant.py b/main_quant.py
+new file mode 100644
+index 0000000..d155500
+--- /dev/null
++++ b/main_quant.py
+@@ -0,0 +1,688 @@
++#!/usr/bin/env python3
++"""Compatibility entrypoint for OpenVLA-OFT-style SimplerEnv evaluation.
++
++This keeps the CLI shape close to `openvla-oft/main_quant.py`, but only
++implements the full-precision SimplerEnv evaluation path used in this repo.
++Quantization-specific flows intentionally fail fast with a clear message.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ast
++import copy
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any, Dict, Iterable, List, Tuple
++
++import numpy as np
++
++from simpler_env.evaluation.maniskill2_evaluator import maniskill2_evaluator
++from simpler_env.policies.openvla.openvla_model import OpenVLAInference
++
++
++RESERVED_ENV_BUILD_KWARGS = {
++    "obs_mode",
++    "robot",
++    "sim_freq",
++    "control_mode",
++    "control_freq",
++    "max_episode_steps",
++    "scene_name",
++    "camera_cfgs",
++    "rgb_overlay_path",
++}
++
++
++EVAL_MODE_CHOICES = (
++    "simplerenv_fp",
++    "simplerenv_official",
++    "simplerenv_quant",
++    "libero_fp",
++    "libero_quant",
++)
++
++EVAL_MODE_HELP = """Unified evaluation mode selector.
++
++Implemented today:
++  - simplerenv_fp: direct FP SimplerEnv evaluation (single task or tasks json)
++  - simplerenv_official: official SimplerEnv benchmark via upstream bash scripts
++  - libero_quant: OpenVLA-OFT LIBERO quant evaluation via wrapper
++
++Interface-only placeholders:
++  - simplerenv_quant
++  - libero_fp
++"""
++
++MODEL_BACKEND_CHOICES = (
++    "openvla",
++    "openvla_oft",
++)
++
++MODEL_BACKEND_HELP = """Unified model backend selector.
++
++Implemented today:
++  - openvla: native OpenVLA FP SimplerEnv path
++
++Interface-only placeholder:
++  - openvla_oft
++"""
++
++OFFICIAL_SIMPLERENV_BENCHMARK_CHOICES = (
++    "all",
++    "bridge",
++    "coke_can_visual_matching",
++    "coke_can_variant",
++    "move_near_visual_matching",
++    "move_near_variant",
++    "drawer_visual_matching_minimal",
++    "drawer_visual_matching",
++    "drawer_variant",
++    "put_in_drawer_visual_matching",
++    "put_in_drawer_variant",
++)
++
++OFFICIAL_SIMPLERENV_SCRIPT_BY_SUBSET = {
++    "bridge": "bridge.sh",
++    "coke_can_visual_matching": "pick_coke_can_visual_matching.sh",
++    "coke_can_variant": "pick_coke_can_variant_agg.sh",
++    "move_near_visual_matching": "move_near_visual_matching.sh",
++    "move_near_variant": "move_near_variant_agg.sh",
++    "drawer_visual_matching_minimal": "drawer_visual_matching_minimal.sh",
++    "drawer_visual_matching": "drawer_visual_matching.sh",
++    "drawer_variant": "drawer_variant_agg.sh",
++    "put_in_drawer_visual_matching": "put_in_drawer_visual_matching.sh",
++    "put_in_drawer_variant": "put_in_drawer_variant_agg.sh",
++}
++
++OFFICIAL_SIMPLERENV_ALL_SCRIPTS = (
++    "bridge.sh",
++    "drawer_variant_agg.sh",
++    "drawer_visual_matching.sh",
++    "move_near_variant_agg.sh",
++    "move_near_visual_matching.sh",
++    "pick_coke_can_variant_agg.sh",
++    "pick_coke_can_visual_matching.sh",
++    "put_in_drawer_variant_agg.sh",
++    "put_in_drawer_visual_matching.sh",
++)
++
++
++def _default_task_json_path(name: str) -> str:
++    return str(Path(__file__).resolve().parent / "eval_logs" / name)
++
++
++# SimplerEnv "full benchmark" presets are intentionally not exposed as a separate
++# eval_mode right now. When we want a canned full run again, pass the task JSON
++# explicitly via --simplerenv_tasks_json instead of introducing another mode.
++# Example preset paths to keep in mind:
++#   - /data5/cgk_lyy_0/zwt/SimplerEnv-OpenVLA-clean/eval_logs/google_full_tasks.json
++#   - <future unified full preset>.json
++
++
++def _openvla_oft_repo_root() -> Path:
++    return Path("/data5/cgk_lyy_0/zwt/SimplerEnv/openvla-oft")
++
++
++def _fresh_repo_root() -> Path:
++    return Path(__file__).resolve().parent
++
++
++def _parse_kv_list_to_dict(items: Iterable[str] | None) -> Dict[str, Any]:
++    out: Dict[str, Any] = {}
++    if not items:
++        return out
++    for kv in items:
++        if "=" not in kv:
++            raise ValueError(f"Invalid additional_env_build_kwargs entry '{kv}', expected key=value")
++        k, v = kv.split("=", 1)
++        if k in RESERVED_ENV_BUILD_KWARGS:
++            raise ValueError(f"additional_env_build_kwargs cannot override reserved key '{k}'")
++        try:
++            out[k] = ast.literal_eval(v)
++        except Exception:
++            out[k] = v
++    return out
++
++
++def _to_quat_list(flat_quats: List[float] | List[List[float]]) -> List[np.ndarray]:
++    if len(flat_quats) == 0:
++        return []
++    if isinstance(flat_quats[0], (list, tuple, np.ndarray)):
++        return [np.asarray(q, dtype=np.float64) for q in flat_quats]  # type: ignore[index]
++    if len(flat_quats) % 4 != 0:
++        raise ValueError(f"robot_init_quats length must be divisible by 4, got {len(flat_quats)}")
++    arr: List[np.ndarray] = []
++    for i in range(0, len(flat_quats), 4):
++        arr.append(np.asarray(flat_quats[i : i + 4], dtype=np.float64))
++    return arr
++
++
++def _apply_policy_runtime_config(model: OpenVLAInference, policy_setup: str, unnorm_key: str | None) -> None:
++    model.policy_setup = policy_setup
++    if policy_setup == "widowx_bridge":
++        model.sticky_gripper_num_repeat = 1
++        model.unnorm_key = "bridge_orig" if unnorm_key is None else unnorm_key
++    elif policy_setup == "google_robot":
++        model.sticky_gripper_num_repeat = 15
++        model.unnorm_key = "fractal20220817_data" if unnorm_key is None else unnorm_key
++    else:
++        raise NotImplementedError(f"Policy setup {policy_setup} not supported for OpenVLA FP eval.")
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
++
++    # Unified top-level evaluation selector.
++    parser.add_argument(
++        "--eval_mode",
++        type=str,
++        default=None,
++        choices=EVAL_MODE_CHOICES,
++        help=EVAL_MODE_HELP,
++    )
++    parser.add_argument(
++        "--model_backend",
++        type=str,
++        default="openvla",
++        choices=MODEL_BACKEND_CHOICES,
++        help=MODEL_BACKEND_HELP,
++    )
++
++    # OpenVLA-OFT compatible legacy high-level switches.
++    parser.add_argument("--config", default="", help="Optional YAML config path.")
++    parser.add_argument("--method", default="fp", help="Quantization method placeholder; FP eval only in this repo.")
++    parser.add_argument("--data", default="", help="Calibration dataset path placeholder; unused for FP-only eval.")
++    parser.add_argument("--n_samples", type=int, default=128)
++    parser.add_argument("--w_bit", type=int, default=8)
++    parser.add_argument("--a_bit", type=int, default=16)
++    parser.add_argument("--w_group", type=int, default=128)
++    parser.add_argument("--scale_path", type=str, default=None)
++    parser.add_argument("--pseudo_quant", action="store_true")
++    parser.add_argument("--run_process", action="store_true")
++    parser.add_argument("--deterministic", action="store_true")
++    parser.add_argument("--rotate_images", action="store_true")
++    parser.add_argument("--eval_simplerenv", action="store_true", help="Run SimplerEnv evaluation.")
++    parser.add_argument(
++        "--fp_simplerenv_only",
++        action="store_true",
++        help="Run full-precision SimplerEnv evaluation without quantization.",
++    )
++
++    # Model / policy.
++    parser.add_argument("--model", type=str, required=True, help="OpenVLA checkpoint path.")
++    parser.add_argument("--policy_model", type=str, default="openvla", choices=["openvla"])
++    parser.add_argument("--policy_setup", type=str, default="google_robot", choices=["google_robot", "widowx_bridge"])
++    parser.add_argument("--unnorm_key", type=str, default=None)
++    parser.add_argument("--action_scale", type=float, default=1.0)
++    parser.add_argument("--action_ensemble_temp", type=float, default=-0.8)
++    parser.add_argument("--use_l1_regression", action="store_true", default=False)
++    parser.add_argument("--num_images", type=int, default=2)
++    parser.add_argument("--use_proprio", action="store_true", default=False)
++    parser.add_argument("--task_suite_name", type=str, default="libero_spatial")
++    parser.add_argument("--num_trials_per_task", type=int, default=50)
++    parser.add_argument("--seed", type=int, default=7)
++    parser.add_argument("--gpu_id", type=int, default=0)
++    parser.add_argument(
++        "--benchmark_subset",
++        type=str,
++        default="all",
++        choices=OFFICIAL_SIMPLERENV_BENCHMARK_CHOICES,
++        help="Subset of the official SimplerEnv benchmark to run when --eval_mode simplerenv_official.",
++    )
++
++    # SimplerEnv arguments mirrored from main_eval.py.
++    parser.add_argument("--robot", type=str, default="google_robot_static")
++    parser.add_argument("--env_name", type=str, default=None)
++    parser.add_argument("--scene_name", type=str, default=None)
++    parser.add_argument("--robot_init_xs", type=float, nargs="+", default=[0.35])
++    parser.add_argument("--robot_init_ys", type=float, nargs="+", default=[0.20])
++    parser.add_argument("--robot_init_quats", type=float, nargs="+", default=[0.0, 0.0, 0.0, 1.0])
++    parser.add_argument("--control_freq", type=int, default=3)
++    parser.add_argument("--sim_freq", type=int, default=513)
++    parser.add_argument("--max_episode_steps", type=int, default=80)
++    parser.add_argument("--rgb_overlay_path", type=str, default=None)
++    parser.add_argument("--obs_camera_name", type=str, default=None)
++    parser.add_argument("--logging_dir", type=str, default="./results")
++    parser.add_argument("--enable_raytracing", action="store_true")
++    parser.add_argument("--additional_env_save_tags", type=str, default=None)
++    parser.add_argument("--obj_variation_mode", type=str, default="episode", choices=["xy", "episode"])
++    parser.add_argument("--obj_init_xs", type=float, nargs="+", default=[])
++    parser.add_argument("--obj_init_ys", type=float, nargs="+", default=[])
++    parser.add_argument("--obj_episode_range", type=int, nargs=2, default=[0, 1])
++    parser.add_argument("--additional_env_build_kwargs", nargs="*", default=[])
++    parser.add_argument(
++        "--simplerenv_tasks_json",
++        type=str,
++        default=None,
++        help="Optional JSON list of task dicts. Task keys can override CLI fields.",
++    )
++
++    # Interface-only placeholders for future unified eval backends.
++    parser.add_argument("--libero_data", type=str, default="", help="Placeholder: LIBERO RLDS dataset path.")
++    parser.add_argument("--libero_task_suite", type=str, default="libero_spatial", help="Placeholder: LIBERO task suite.")
++    parser.add_argument(
++        "--openvla_oft_model",
++        type=str,
++        default="",
++        help="Placeholder: OpenVLA-OFT checkpoint / merged model path for unified eval.",
++    )
++    return parser.parse_args()
++
++
++def _apply_config_overrides(args: argparse.Namespace) -> list[argparse.Namespace]:
++    if not args.config:
++        return [args]
++
++    try:
++        import yaml
++    except ModuleNotFoundError as exc:
++        raise RuntimeError("--config requires PyYAML, which is not installed in this environment.") from exc
++
++    config_path = Path(args.config)
++    if not config_path.exists():
++        raise FileNotFoundError(f"Config file does not exist: {config_path}")
++
++    payload = yaml.safe_load(config_path.read_text())
++    items = payload if isinstance(payload, list) else [payload]
++
++    merged: list[argparse.Namespace] = []
++    for item in items:
++        if not isinstance(item, dict):
++            raise ValueError("--config must contain a dict or a list of dicts")
++        cfg_args = copy.deepcopy(args)
++        for key, value in item.items():
++            if not hasattr(cfg_args, key):
++                raise ValueError(f"Unknown key in config: {key}")
++            setattr(cfg_args, key, value)
++        merged.append(cfg_args)
++    return merged
++
++
++def _load_task_list(task_json_path: str) -> list[dict]:
++    with open(task_json_path, "r", encoding="utf-8") as f:
++        payload = json.load(f)
++    if not isinstance(payload, list):
++        raise ValueError("--simplerenv_tasks_json must point to a JSON list")
++    if len(payload) == 0:
++        raise ValueError("--simplerenv_tasks_json contains an empty task list")
++    for i, item in enumerate(payload):
++        if not isinstance(item, dict):
++            raise ValueError(f"Task entry #{i} must be an object/dict")
++    return payload
++
++
++def _build_task_args(base_args: argparse.Namespace, task_dict: dict, idx: int) -> tuple[argparse.Namespace, str]:
++    args_i = copy.deepcopy(base_args)
++    label = str(task_dict.get("result_label", f"SimplerEnv FP Evaluation #{idx + 1}"))
++
++    blocked_keys = {"simplerenv_tasks_json", "policy_model", "result_label"}
++    for key, value in task_dict.items():
++        if key in blocked_keys:
++            continue
++        if not hasattr(args_i, key):
++            raise ValueError(f"Unknown task key in --simplerenv_tasks_json: {key}")
++        setattr(args_i, key, value)
++
++    return args_i, label
++
++
++def _validate_eval_args(args: argparse.Namespace) -> None:
++    if args.policy_model != "openvla":
++        raise NotImplementedError("Only --policy_model openvla is supported in FP mode.")
++    if args.action_scale <= 0:
++        raise ValueError("--action_scale must be positive")
++    if not args.env_name or not args.scene_name:
++        raise ValueError("--env_name and --scene_name are required")
++    if len(args.robot_init_quats) == 0:
++        raise ValueError("--robot_init_quats cannot be empty")
++    if args.obj_variation_mode == "xy":
++        if len(args.obj_init_xs) == 0 or len(args.obj_init_ys) == 0:
++            raise ValueError("obj_init_xs and obj_init_ys are required when --obj_variation_mode=xy")
++    else:
++        if len(args.obj_episode_range) != 2 or not (0 <= args.obj_episode_range[0] < args.obj_episode_range[1]):
++            raise ValueError("obj_episode_range must be [start, end] with 0 <= start < end")
++
++
++def _make_runtime_args(args: argparse.Namespace) -> SimpleNamespace:
++    run_args = SimpleNamespace()
++    run_args.policy_model = args.policy_model
++    run_args.ckpt_path = args.model
++    run_args.policy_setup = args.policy_setup
++    run_args.robot = args.robot
++    run_args.env_name = args.env_name
++    run_args.scene_name = args.scene_name
++    run_args.action_scale = float(args.action_scale)
++    run_args.control_freq = int(args.control_freq)
++    run_args.sim_freq = int(args.sim_freq)
++    run_args.max_episode_steps = int(args.max_episode_steps)
++    run_args.enable_raytracing = bool(args.enable_raytracing)
++    run_args.additional_env_save_tags = args.additional_env_save_tags
++    run_args.rgb_overlay_path = args.rgb_overlay_path
++    run_args.obs_camera_name = args.obs_camera_name
++    run_args.logging_dir = args.logging_dir
++    run_args.obj_variation_mode = args.obj_variation_mode
++    run_args.obj_episode_range = list(args.obj_episode_range)
++    run_args.obj_init_xs = np.asarray(args.obj_init_xs, dtype=np.float64)
++    run_args.obj_init_ys = np.asarray(args.obj_init_ys, dtype=np.float64)
++    run_args.robot_init_xs = np.asarray(args.robot_init_xs, dtype=np.float64)
++    run_args.robot_init_ys = np.asarray(args.robot_init_ys, dtype=np.float64)
++    run_args.robot_init_quats = _to_quat_list(list(args.robot_init_quats))
++
++    add_kwargs = args.additional_env_build_kwargs
++    if isinstance(add_kwargs, dict):
++        run_args.additional_env_build_kwargs = dict(add_kwargs)
++    elif isinstance(add_kwargs, list):
++        run_args.additional_env_build_kwargs = _parse_kv_list_to_dict(add_kwargs)
++    else:
++        run_args.additional_env_build_kwargs = {}
++
++    if "renderer_kwargs" not in run_args.additional_env_build_kwargs and not os.environ.get("DISPLAY"):
++        run_args.additional_env_build_kwargs["renderer_kwargs"] = {"offscreen_only": True}
++
++    return run_args
++
++
++def _normalize_eval_results(eval_results: Any) -> Tuple[np.ndarray, np.ndarray]:
++    if isinstance(eval_results, dict) and "entire" in eval_results and "partial" in eval_results:
++        entire = np.asarray(eval_results["entire"], dtype=np.float32)
++        partial = np.asarray(eval_results["partial"], dtype=np.float32)
++        return entire, partial
++
++    arr = np.asarray(eval_results, dtype=np.float32)
++    return arr, arr
++
++
++def _resolve_eval_mode(args: argparse.Namespace) -> str:
++    if args.eval_mode:
++        return args.eval_mode
++
++    # Legacy compatibility with the current FP-only entrypoint behavior.
++    if args.eval_simplerenv or args.fp_simplerenv_only:
++        return "simplerenv_fp"
++
++    raise ValueError(
++        "No evaluation mode selected. Pass --eval_mode <mode>. "
++        "Legacy fallback only supports --eval_simplerenv / --fp_simplerenv_only."
++    )
++
++
++def _ensure_task_json_present(task_json: str, mode: str) -> str:
++    if not Path(task_json).exists():
++        raise NotImplementedError(
++            f"{mode} expects task JSON at '{task_json}', but that file is not present in this repo clone yet."
++        )
++    return task_json
++
++
++def _resolve_model_backend(args: argparse.Namespace) -> str:
++    return args.model_backend
++
++
++def _append_cli_arg(cmd: list[str], flag: str, value: Any) -> None:
++    if value is None:
++        return
++    cmd.extend([flag, str(value)])
++
++
++def _append_cli_multi_arg(cmd: list[str], flag: str, values: Iterable[Any] | None) -> None:
++    if values is None:
++        return
++    values_list = list(values)
++    if not values_list:
++        return
++    cmd.append(flag)
++    cmd.extend(str(v) for v in values_list)
++
++
++def _run_openvla_oft_libero_quant_mode(args: argparse.Namespace, backend: str) -> None:
++    oft_root = _openvla_oft_repo_root()
++    oft_main = oft_root / "main_quant.py"
++    if not oft_main.exists():
++        raise FileNotFoundError(f"OpenVLA-OFT entrypoint not found: {oft_main}")
++    if not args.data:
++        raise ValueError("libero_quant requires --data for OpenVLA-OFT calibration/evaluation.")
++
++    method = str(args.method).strip()
++    if method in {"", "fp"}:
++        raise ValueError("libero_quant requires a quantization --method such as mbq / awq / smoothquant / rtn.")
++
++    model_path = args.openvla_oft_model or args.model
++    cmd = [
++        sys.executable,
++        str(oft_main),
++        "--model",
++        model_path,
++        "--data",
++        str(args.data),
++        "--method",
++        method,
++        "--eval_libero",
++        "--task_suite_name",
++        str(args.task_suite_name),
++        "--num_trials_per_task",
++        str(args.num_trials_per_task),
++        "--seed",
++        str(args.seed),
++        "--num_images",
++        str(args.num_images),
++        "--n_samples",
++        str(args.n_samples),
++        "--w_bit",
++        str(args.w_bit),
++        "--a_bit",
++        str(args.a_bit),
++        "--w_group",
++        str(args.w_group),
++    ]
++
++    if args.unnorm_key:
++        _append_cli_arg(cmd, "--unnorm_key", args.unnorm_key)
++    if args.scale_path:
++        _append_cli_arg(cmd, "--scale_path", args.scale_path)
++    if args.use_l1_regression:
++        cmd.append("--use_l1_regression")
++    if args.use_proprio:
++        cmd.append("--use_proprio")
++    if args.pseudo_quant:
++        cmd.append("--pseudo_quant")
++    if args.run_process:
++        cmd.append("--run_process")
++    if args.deterministic:
++        cmd.append("--deterministic")
++    if args.rotate_images:
++        cmd.append("--rotate_images")
++
++    print(f"[main_quant] forwarding LIBERO quant to OpenVLA-OFT: {' '.join(cmd)}")
++    subprocess.run(cmd, check=True, cwd=str(oft_root))
++
++
++def _run_openvla_simplerenv_official_mode(args: argparse.Namespace, backend: str) -> None:
++    repo_root = _fresh_repo_root()
++    scripts_dir = repo_root / "scripts"
++    ckpt_path = str(Path(args.model).expanduser())
++    logging_dir = str(Path(args.logging_dir).expanduser())
++    gpu_id = str(args.gpu_id)
++    action_ensemble_temp = str(args.action_ensemble_temp)
++    policy_model = args.policy_model
++    env = os.environ.copy()
++    python_bin_dir = str(Path(sys.executable).resolve().parent)
++    env["PATH"] = python_bin_dir + os.pathsep + env.get("PATH", "")
++    # Force CUDA ordinal mapping to follow PCI bus order so --gpu_id matches nvidia-smi index.
++    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
++
++    if args.benchmark_subset != "all":
++        script_name = OFFICIAL_SIMPLERENV_SCRIPT_BY_SUBSET[args.benchmark_subset]
++        script_path = scripts_dir / script_name
++        cmd = [
++            "bash",
++            str(script_path),
++            ckpt_path,
++            policy_model,
++            action_ensemble_temp,
++            logging_dir,
++            gpu_id,
++        ]
++        if not script_path.exists():
++            raise FileNotFoundError(f"Official SimplerEnv script not found: {script_path}")
++        print(f"[main_quant] forwarding official SimplerEnv benchmark: {' '.join(cmd)}")
++        subprocess.run(cmd, check=True, cwd=str(repo_root), env=env)
++        return
++
++    os.makedirs(logging_dir, exist_ok=True)
++    for script_name in OFFICIAL_SIMPLERENV_ALL_SCRIPTS:
++        script_path = scripts_dir / script_name
++        if not script_path.exists():
++            raise FileNotFoundError(f"Official SimplerEnv script not found: {script_path}")
++        cmd = [
++            "bash",
++            str(script_path),
++            ckpt_path,
++            policy_model,
++            action_ensemble_temp,
++            logging_dir,
++            gpu_id,
++        ]
++        print(f"[main_quant] forwarding official SimplerEnv benchmark: {' '.join(cmd)}")
++        subprocess.run(cmd, check=True, cwd=str(repo_root), env=env)
++
++    metrics_cmd = [
++        sys.executable,
++        str(repo_root / "tools" / "calc_metrics_evaluation_videos.py"),
++        "--log-dir-root",
++        logging_dir,
++    ]
++    print(f"[main_quant] summarizing official SimplerEnv benchmark: {' '.join(metrics_cmd)}")
++    with open(Path(logging_dir) / "total.metrics", "a", encoding="utf-8") as metrics_file:
++        subprocess.run(metrics_cmd, check=True, cwd=str(repo_root), env=env, stdout=metrics_file)
++
++
++def _run_openvla_libero_fp_mode(args: argparse.Namespace, backend: str) -> None:
++    raise NotImplementedError(
++        "libero_fp with model_backend=openvla is now a first-class interface, "
++        "but the native OpenVLA LIBERO FP runner has not been wired yet."
++    )
++
++
++def _run_openvla_oft_libero_fp_mode(args: argparse.Namespace, backend: str) -> None:
++    raise NotImplementedError(
++        "libero_fp with model_backend=openvla_oft is now a first-class interface, "
++        "but the OpenVLA-OFT LIBERO FP runner has not been wired yet."
++    )
++
++
++def _run_task(task_args: argparse.Namespace, label: str, model_cache: Dict[str, OpenVLAInference]) -> None:
++    _validate_eval_args(task_args)
++    runtime_args = _make_runtime_args(task_args)
++    unnorm_key = task_args.unnorm_key
++
++    cache_key = str(task_args.model)
++    if cache_key not in model_cache:
++        model_cache[cache_key] = OpenVLAInference(
++            saved_model_path=task_args.model,
++            unnorm_key=unnorm_key,
++            policy_setup=task_args.policy_setup,
++            action_scale=task_args.action_scale,
++        )
++
++    model = model_cache[cache_key]
++    model.action_scale = task_args.action_scale
++    _apply_policy_runtime_config(model, task_args.policy_setup, unnorm_key)
++
++    os.makedirs(task_args.logging_dir, exist_ok=True)
++    print(f"\n[{label}]")
++    eval_results = maniskill2_evaluator(model, runtime_args)
++    entire_arr, partial_arr = _normalize_eval_results(eval_results)
++
++    n = len(entire_arr)
++    avg_entire = float(np.mean(entire_arr)) if n > 0 else 0.0
++    avg_partial = float(np.mean(partial_arr)) if n > 0 else 0.0
++    print(f"[{label}] Entire  success: {avg_entire:.4f} ({avg_entire * 100:.1f}%) — {int(np.sum(entire_arr))}/{n}")
++    print(f"[{label}] Partial success: {avg_partial:.4f} ({avg_partial * 100:.1f}%) — {int(np.sum(partial_arr))}/{n}")
++
++
++def _run_fp_eval(args: argparse.Namespace) -> None:
++    if args.simplerenv_tasks_json:
++        tasks = _load_task_list(args.simplerenv_tasks_json)
++        print(f"[SimplerEnv-FP] Loaded {len(tasks)} tasks from {args.simplerenv_tasks_json}")
++    else:
++        tasks = [{}]
++
++    model_cache = {}
++    for i, task_dict in enumerate(tasks):
++        task_args, label = _build_task_args(args, task_dict, i)
++        _run_task(task_args, label, model_cache)
++
++
++def _run_simplerenv_fp_mode(args: argparse.Namespace) -> None:
++    _run_fp_eval(args)
++
++
++def _run_placeholder_mode(args: argparse.Namespace, mode: str, backend: str) -> None:
++    raise NotImplementedError(
++        f"{mode} with model_backend={backend} has been promoted to a first-class interface, "
++        "but this backend pair is not wired yet."
++    )
++
++
++def _run_simplerenv_mode(args: argparse.Namespace, mode: str, backend: str) -> None:
++    if backend != "openvla":
++        _run_placeholder_mode(args, mode, backend)
++        return
++
++    if mode == "simplerenv_fp":
++        _run_simplerenv_fp_mode(args)
++        return
++    if mode == "simplerenv_official":
++        _run_openvla_simplerenv_official_mode(args, backend)
++        return
++
++    _run_placeholder_mode(args, mode, backend)
++
++
++def _run_libero_mode(args: argparse.Namespace, mode: str, backend: str) -> None:
++    if mode == "libero_fp" and backend == "openvla":
++        _run_openvla_libero_fp_mode(args, backend)
++        return
++    if mode == "libero_fp" and backend == "openvla_oft":
++        _run_openvla_oft_libero_fp_mode(args, backend)
++        return
++    if mode == "libero_quant" and backend == "openvla_oft":
++        _run_openvla_oft_libero_quant_mode(args, backend)
++        return
++    _run_placeholder_mode(args, mode, backend)
++
++
++def _run_openvla_oft_mode(args: argparse.Namespace, mode: str, backend: str) -> None:
++    _run_placeholder_mode(args, mode, backend)
++
++
++def _dispatch_eval_mode(args: argparse.Namespace) -> None:
++    mode = _resolve_eval_mode(args)
++    backend = _resolve_model_backend(args)
++    print(f"[main_quant] eval_mode={mode} model_backend={backend}")
++
++    if mode.startswith("simplerenv_"):
++        _run_simplerenv_mode(args, mode, backend)
++        return
++    if mode.startswith("libero_"):
++        _run_libero_mode(args, mode, backend)
++        return
++
++    _run_placeholder_mode(args, mode, backend)
++
++
++def main() -> None:
++    base_args = _parse_args()
++    args_list = _apply_config_overrides(base_args)
++
++    for args in args_list:
++        _dispatch_eval_mode(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/drawer_visual_matching_minimal.sh b/scripts/drawer_visual_matching_minimal.sh
+new file mode 100644
+index 0000000..04813dd
+--- /dev/null
++++ b/scripts/drawer_visual_matching_minimal.sh
+@@ -0,0 +1,62 @@
++ckpt_path=$1
++policy_model=$2
++action_ensemble_temp=$3
++logging_dir=$4
++gpu_id=$5
++overlay_root=/data5/cgk_lyy_0/zwt/SimplerEnv-OpenVLA-clean/ManiSkill2_real2sim/data/real_inpainting
++
++declare -a ckpt_paths=($ckpt_path)
++
++declare -a env_names=(
++  OpenTopDrawerCustomInScene-v0
++  CloseTopDrawerCustomInScene-v0
++)
++
++declare -a urdf_version_arr=("recolor_tabletop_visual_matching_1" None)
++
++for urdf_version in "${urdf_version_arr[@]}"; do
++
++  EXTRA_ARGS="--enable-raytracing --additional-env-build-kwargs station_name=mk_station_recolor light_mode=simple disable_bad_material=True urdf_version=${urdf_version}"
++
++  EvalOverlay() {
++    # A0
++    CUDA_VISIBLE_DEVICES=${gpu_id} python simpler_env/main_inference.py --policy-model ${policy_model} --ckpt-path ${ckpt_path} --action-ensemble-temp ${action_ensemble_temp} --logging-dir ${logging_dir} \
++      --robot google_robot_static \
++      --control-freq 3 --sim-freq 513 --max-episode-steps 113 \
++      --env-name ${env_name} --scene-name dummy_drawer \
++      --robot-init-x 0.644 0.644 1 --robot-init-y -0.179 -0.179 1 \
++      --robot-init-rot-quat-center 0 0 0 1 --robot-init-rot-rpy-range 0 0 1 0 0 1 -0.03 -0.03 1 \
++      --obj-init-x-range 0 0 1 --obj-init-y-range 0 0 1 \
++      --rgb-overlay-path ${overlay_root}/open_drawer_a0.png \
++      ${EXTRA_ARGS}
++
++    # B0
++    CUDA_VISIBLE_DEVICES=${gpu_id} python simpler_env/main_inference.py --policy-model ${policy_model} --ckpt-path ${ckpt_path} --action-ensemble-temp ${action_ensemble_temp} --logging-dir ${logging_dir} \
++      --robot google_robot_static \
++      --control-freq 3 --sim-freq 513 --max-episode-steps 113 \
++      --env-name ${env_name} --scene-name dummy_drawer \
++      --robot-init-x 0.652 0.652 1 --robot-init-y 0.009 0.009 1 \
++      --robot-init-rot-quat-center 0 0 0 1 --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
++      --obj-init-x-range 0 0 1 --obj-init-y-range 0 0 1 \
++      --rgb-overlay-path ${overlay_root}/open_drawer_b0.png \
++      ${EXTRA_ARGS}
++
++    # C0
++    CUDA_VISIBLE_DEVICES=${gpu_id} python simpler_env/main_inference.py --policy-model ${policy_model} --ckpt-path ${ckpt_path} --action-ensemble-temp ${action_ensemble_temp} --logging-dir ${logging_dir} \
++      --robot google_robot_static \
++      --control-freq 3 --sim-freq 513 --max-episode-steps 113 \
++      --env-name ${env_name} --scene-name dummy_drawer \
++      --robot-init-x 0.665 0.665 1 --robot-init-y 0.224 0.224 1 \
++      --robot-init-rot-quat-center 0 0 0 1 --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
++      --obj-init-x-range 0 0 1 --obj-init-y-range 0 0 1 \
++      --rgb-overlay-path ${overlay_root}/open_drawer_c0.png \
++      ${EXTRA_ARGS}
++  }
++
++  for ckpt_path in "${ckpt_paths[@]}"; do
++    for env_name in "${env_names[@]}"; do
++      EvalOverlay
++    done
++  done
++
++done

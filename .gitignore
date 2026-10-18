@@ -151,3 +151,11 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+# Local evaluation and calibration artifacts
+/runs/
+/experiment_logs/
+/experiments/logs/
+/smoke/
+/smoothquant_scales/
+/smoothquant_logs/

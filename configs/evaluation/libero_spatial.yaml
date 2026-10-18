@@ -1,0 +1,29 @@
+# Local paths for the current server. CLI options override this mapping.
+model_backend: openvla_oft
+benchmark: libero
+mode: fp
+checkpoint: /root/autodl-tmp/models/openvla-7b-oft-finetuned-libero-spatial
+task_suite_name: libero_spatial
+num_trials_per_task: 50
+seed: 7
+num_images: 2
+use_proprio: true
+
+# Used only when --mode quant is supplied.
+method: smoothquant
+data: /root/autodl-tmp/libero_spatial_no_noops/1.0.0
+n_samples: 256
+calib_sampling: proprio_stratified
+calib_prompt_balance: true
+deterministic: true
+w_bit: 8
+a_bit: 8
+k_bit: 16
+v_bit: 16
+alpha: 0.5
+sq_target: llm
+sq_scale_mode: max
+sq_w_asym: false
+sq_a_asym: true
+run_process: false
+scale_path: /root/autodl-tmp/Quant/smoothquant_scales/libero_spatial/w8a8kv16_alpha0.5_proprio_stratified/scale.pt

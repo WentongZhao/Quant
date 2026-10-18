@@ -1,0 +1,898 @@
+diff --git a/simpler_env/evaluation/maniskill2_evaluator.py b/simpler_env/evaluation/maniskill2_evaluator.py
+index a824479..b75d159 100644
+--- a/simpler_env/evaluation/maniskill2_evaluator.py
++++ b/simpler_env/evaluation/maniskill2_evaluator.py
+@@ -113,7 +113,16 @@ def run_maniskill2_eval_single_episode(
+     task_descriptions = []
+     while not (predicted_terminated or truncated):
+         # step the model; "raw_action" is raw model action output; "action" is the processed action to be sent into maniskill env
+-        raw_action, action = model.step(image, task_description, eef_pos=obs["agent"]["eef_pos"])
++        step_call_kwargs = {}
++        if isinstance(obs, dict):
++            agent_obs = obs.get("agent")
++            if isinstance(agent_obs, dict) and "eef_pos" in agent_obs:
++                step_call_kwargs["eef_pos"] = agent_obs["eef_pos"]
++
++        if step_call_kwargs:
++            raw_action, action = model.step(image, task_description, **step_call_kwargs)
++        else:
++            raw_action, action = model.step(image, task_description)
+         predicted_actions.append(raw_action)
+         predicted_terminated = bool(action["terminate_episode"][0] > 0)
+         if predicted_terminated:
+diff --git a/simpler_env/policies/openvla/openvla_model.py b/simpler_env/policies/openvla/openvla_model.py
+index 715c779..d50bad8 100644
+--- a/simpler_env/policies/openvla/openvla_model.py
++++ b/simpler_env/policies/openvla/openvla_model.py
+@@ -1,5 +1,6 @@
+ from typing import Optional, Sequence
+ import os
++import warnings
+ import matplotlib.pyplot as plt
+ import numpy as np
+ from transforms3d.euler import euler2axangle
+@@ -35,15 +36,28 @@ class OpenVLAInference:
+         self.policy_setup = policy_setup
+         self.unnorm_key = unnorm_key
+ 
+-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
++        self.device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
++        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, device: {self.device} ***")
+         self.processor = AutoProcessor.from_pretrained(saved_model_path, trust_remote_code=True)
+-        self.vla = AutoModelForVision2Seq.from_pretrained(
+-            saved_model_path,
+-            attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
+-            torch_dtype=torch.bfloat16,
+-            low_cpu_mem_usage=True,
+-            trust_remote_code=True,
+-        ).cuda()
++        try:
++            self.vla = AutoModelForVision2Seq.from_pretrained(
++                saved_model_path,
++                attn_implementation="flash_attention_2",  # Optional; requires flash_attn
++                torch_dtype=torch.bfloat16,
++                low_cpu_mem_usage=True,
++                trust_remote_code=True,
++            ).to(self.device)
++        except ImportError as e:
++            warnings.warn(
++                "flash_attention_2 unavailable; falling back to default attention implementation. "
++                f"Original error: {e}"
++            )
++            self.vla = AutoModelForVision2Seq.from_pretrained(
++                saved_model_path,
++                torch_dtype=torch.bfloat16,
++                low_cpu_mem_usage=True,
++                trust_remote_code=True,
++            ).to(self.device)
+ 
+         self.image_size = image_size
+         self.action_scale = action_scale
+@@ -92,12 +106,28 @@ class OpenVLAInference:
+         image = self._resize_image(image)
+ 
+         image: Image.Image = Image.fromarray(image)
+-        prompt = task_description
++        prompt = f"In: What action should the robot take to {task_description}?\nOut:"
+ 
+         # predict action (7-dof; un-normalize for bridgev2)
+-        inputs = self.processor(prompt, image).to("cuda:0", dtype=torch.bfloat16)
+-        raw_actions = self.vla.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=False)[None]
+-        # print(f"*** raw actions {raw_actions} ***")
++        inputs = self.processor(prompt, image).to(self.device, dtype=torch.bfloat16)
++        # CRITICAL FIX: predict_action() appends token 29871 to input_ids,
++        # but the processor-provided attention_mask is NOT extended, causing a
++        # shape mismatch (embeddings vs mask off-by-one) inside forward().
++        # Removing attention_mask lets generate() create the correct one.
++        inputs.pop("attention_mask", None)
++        pred = self.vla.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=False)
++        # Compatible with both return styles:
++        #  - ndarray action
++        #  - tuple(action, extra_info)
++        raw_actions = pred[0] if isinstance(pred, tuple) else pred
++        raw_actions = np.asarray(raw_actions)
++        if raw_actions.ndim == 1:
++            raw_actions = raw_actions[None, :]
++        if not hasattr(self, '_dbg_cnt'):
++            self._dbg_cnt = 0
++        if self._dbg_cnt < 5:
++            print(f"[DBG] step {self._dbg_cnt} raw_actions={raw_actions[0]} prompt={prompt[:60]}...")
++            self._dbg_cnt += 1
+ 
+         raw_action = {
+             "world_vector": np.array(raw_actions[0, :3]),
+diff --git a/eval_openvla7b.sh b/eval_openvla7b.sh
+new file mode 100755
+index 0000000..3d98b95
+--- /dev/null
++++ b/eval_openvla7b.sh
+@@ -0,0 +1,309 @@
++#!/usr/bin/env bash
++# ===========================================================================
++#  eval_openvla7b.sh  —  干净的 openvla-7b SimplerEnv 评测脚本
++#
++#  用法:
++#    CUDA_VISIBLE_DEVICES=1 bash eval_openvla7b.sh          # 跑全量 340 tasks
++#    CUDA_VISIBLE_DEVICES=1 bash eval_openvla7b.sh --quick   # 只跑 4 个 widowx 快速验证
++#
++#  此脚本完全独立于 OFT/quant 代码，不会触发任何 modeling_prismatic.py 覆盖。
++# ===========================================================================
++set -euo pipefail
++
++# ── 配置 ──────────────────────────────────────────────────────────
++MODEL_PATH="${MODEL_PATH:-/data5/cgk_lyy_0/models/openvla-7b}"
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++SIMPLERENV_OPENVLA_DIR="${SCRIPT_DIR}"       # SimplerEnv-OpenVLA 根目录
++LOG_DIR="${SCRIPT_DIR}/eval_logs"
++TASK_JSON_DIR="${LOG_DIR}"
++OVERLAY_BASE="/data5/cgk_lyy_0/zwt/SimplerEnv/ManiSkill2_real2sim/data/real_inpainting"
++
++mkdir -p "${LOG_DIR}"
++
++TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
++LOG_FILE="${LOG_DIR}/eval_openvla7b_${TIMESTAMP}.log"
++
++QUICK_MODE=0
++GOOGLE_ONLY=0
++for arg in "$@"; do
++    case "$arg" in
++        --quick)   QUICK_MODE=1 ;;
++        --google)  GOOGLE_ONLY=1 ;;
++    esac
++done
++
++# ── 安全检查: modeling_prismatic.py 必须是原版 (562 行) ───────────
++echo "[CHECK] Verifying modeling_prismatic.py is the original (non-OFT) version..."
++MODELING_FILE="${MODEL_PATH}/modeling_prismatic.py"
++if [[ -f "${MODELING_FILE}" ]]; then
++    LINE_COUNT=$(wc -l < "${MODELING_FILE}")
++    if (( LINE_COUNT > 600 )); then
++        echo "[ERROR] ${MODELING_FILE} has ${LINE_COUNT} lines — looks like OFT version!"
++        echo "[ERROR] Expected ~562 lines (original openvla-7b)."
++        echo "[ERROR] Restoring from backup..."
++
++        # 尝试从已知的原版 backup 恢复
++        BACKUP_CANDIDATES=(
++            "${MODEL_PATH}/modeling_prismatic.py.back.20260330_221013"
++            "${MODEL_PATH}/modeling_prismatic.py.back.20260331_202934"
++        )
++        RESTORED=0
++        for bk in "${BACKUP_CANDIDATES[@]}"; do
++            if [[ -f "$bk" ]]; then
++                bk_lines=$(wc -l < "$bk")
++                if (( bk_lines < 600 )); then
++                    cp "$bk" "${MODELING_FILE}"
++                    echo "[FIXED] Restored from ${bk} (${bk_lines} lines)"
++                    RESTORED=1
++                    break
++                fi
++            fi
++        done
++        if (( RESTORED == 0 )); then
++            echo "[FATAL] No valid backup found. Cannot proceed."
++            exit 1
++        fi
++    else
++        echo "[OK] modeling_prismatic.py: ${LINE_COUNT} lines (original)"
++    fi
++else
++    echo "[FATAL] ${MODELING_FILE} not found!"
++    exit 1
++fi
++
++# 同步到 HF cache (trust_remote_code 可能从这里加载)
++HF_CACHE_DIR="${HOME}/.cache/huggingface/modules/transformers_modules/openvla-7b"
++if [[ -d "${HF_CACHE_DIR}" ]]; then
++    cp "${MODELING_FILE}" "${HF_CACHE_DIR}/modeling_prismatic.py"
++    echo "[OK] Synced to HF cache: ${HF_CACHE_DIR}"
++fi
++
++# ── 生成 task JSON ───────────────────────────────────────────────
++TASK_JSON="${TASK_JSON_DIR}/eval_tasks_${TIMESTAMP}.json"
++echo "[INFO] Generating task JSON..."
++
++python3 - "${TASK_JSON}" "${MODEL_PATH}" "${OVERLAY_BASE}" "${QUICK_MODE}" "${GOOGLE_ONLY}" << 'PYEOF'
++import json, sys
++
++task_json_path = sys.argv[1]
++model_path = sys.argv[2]
++overlay_base = sys.argv[3]
++quick_mode = int(sys.argv[4])
++google_only = int(sys.argv[5])
++
++tasks = []
++
++def T(label, env, scene, robot, policy_setup, unnorm_key,
++      control_freq=5, sim_freq=500, max_episode_steps=60,
++      obj_episode_range=None, robot_init_xs=None, robot_init_ys=None,
++      robot_init_quats=None, action_scale=1.0,
++      rgb_overlay_path=None, additional_env_build_kwargs=None,
++      obs_camera_name=None):
++    if obj_episode_range is None:
++        obj_episode_range = [0, 24]
++    if robot_init_xs is None:
++        robot_init_xs = [0.147]
++    if robot_init_ys is None:
++        robot_init_ys = [0.028]
++    if robot_init_quats is None:
++        robot_init_quats = [0.0, 0.0, 0.0, 1.0]
++    tasks.append({
++        "result_label": label,
++        "model": model_path,
++        "unnorm_key": unnorm_key,
++        "policy_setup": policy_setup,
++        "action_scale": action_scale,
++        "robot": robot,
++        "env_name": env,
++        "scene_name": scene,
++        "robot_init_xs": robot_init_xs,
++        "robot_init_ys": robot_init_ys,
++        "robot_init_quats": robot_init_quats,
++        "control_freq": control_freq,
++        "sim_freq": sim_freq,
++        "max_episode_steps": max_episode_steps,
++        "obj_variation_mode": "episode",
++        "obj_init_xs": [],
++        "obj_init_ys": [],
++        "obj_episode_range": obj_episode_range,
++        "enable_raytracing": False,
++        "additional_env_build_kwargs": additional_env_build_kwargs or [],
++        "rgb_overlay_path": rgb_overlay_path,
++        "obs_camera_name": obs_camera_name,
++    })
++
++OVL = f"{overlay_base}/bridge_real_eval_1.png"
++
++# ── WidowX Bridge tasks (4) ──────────────────────────────────────
++if not google_only:
++    T("spoon", "PutSpoonOnTableClothInScene-v0", "bridge_table_1_v1",
++      "widowx", "widowx_bridge", "bridge_orig", rgb_overlay_path=OVL)
++
++    T("carrot", "PutCarrotOnPlateInScene-v0", "bridge_table_1_v1",
++      "widowx", "widowx_bridge", "bridge_orig", rgb_overlay_path=OVL)
++
++    T("stack", "StackGreenCubeOnYellowCubeBakedTexInScene-v0", "bridge_table_1_v1",
++      "widowx", "widowx_bridge", "bridge_orig", rgb_overlay_path=OVL)
++
++    T("eggplant", "PutEggplantInBasketScene-v0", "bridge_table_1_v2",
++      "widowx_sink_camera_setup", "widowx_bridge", "bridge_orig",
++      rgb_overlay_path=f"{overlay_base}/bridge_real_eval_2.png")
++
++if quick_mode and not google_only:
++    json.dump(tasks, open(task_json_path, "w"), indent=2)
++    print(f"[QUICK] Generated {len(tasks)} tasks (widowx only)")
++    sys.exit(0)
++
++# ── Google Robot: Coke Can Visual Matching (12 urdf × 3 orient = 36 combos, 25 eps each) ──
++google_defaults = dict(
++    scene="google_pick_coke_can_1_v4",
++    robot="google_robot_static",
++    policy_setup="google_robot",
++    unnorm_key="fractal20220817_data",
++    control_freq=3, sim_freq=513, max_episode_steps=80,
++    robot_init_xs=[0.35, 0.35],
++    robot_init_ys=[0.20, 0.21],
++    robot_init_quats=[0.0, 0.0, 0.0, 1.0],
++    obj_episode_range=[0, 25],
++)
++
++urdf_variants = [
++    None,
++    "recolor_tabletop_visual_matching_1",
++    "recolor_tabletop_visual_matching_2",
++    "recolor_cabinet_visual_matching_1",
++]
++orientations = ["horizontal", "vertical", "standing"]
++
++for urdf in urdf_variants:
++    for orient in orientations:
++        urdf_tag = f"_urdf_{urdf}" if urdf else "_urdf_None"
++        label = f"coke_vm_{orient}{urdf_tag}"
++        env_kwargs = {}
++        if orient == "horizontal":
++            env_kwargs["obj_init_options"] = {"init_xy_range_ls": [[[0.15, 0.35], [-0.05, 0.15]]]}
++        elif orient == "vertical":
++            env_kwargs["obj_init_options"] = {"init_xy_range_ls": [[[0.15, 0.35], [-0.05, 0.15]]],
++                                              "orientation": "laid_vertically"}
++        elif orient == "standing":
++            env_kwargs["obj_init_options"] = {"init_xy_range_ls": [[[0.15, 0.35], [-0.05, 0.15]]],
++                                              "orientation": "standing"}
++        build_kwargs = [f"urdf_version={urdf}"] if urdf else []
++        if orient == "horizontal":
++            build_kwargs.append("model_ids=opened_coke_can")
++        elif orient == "vertical":
++            build_kwargs.append("model_ids=opened_coke_can_v2")
++        elif orient == "standing":
++            build_kwargs.append("model_ids=opened_coke_can")
++
++        T(label, "GraspSingleOpenedCokeCanInScene-v0",
++          additional_env_build_kwargs=build_kwargs,
++          **google_defaults)
++
++# ── Google Robot: Move Near Visual Matching (4 urdf, 4 eps each) ──
++move_near_defaults = dict(
++    scene="google_pick_coke_can_1_v4",
++    robot="google_robot_static",
++    policy_setup="google_robot",
++    unnorm_key="fractal20220817_data",
++    control_freq=3, sim_freq=513, max_episode_steps=80,
++    robot_init_xs=[0.35, 0.35],
++    robot_init_ys=[0.20, 0.21],
++    robot_init_quats=[0.0, 0.0, 0.0, 1.0],
++    obj_episode_range=[0, 4],
++)
++for urdf in urdf_variants:
++    urdf_tag = f"_urdf_{urdf}" if urdf else "_urdf_None"
++    label = f"move_near_vm{urdf_tag}"
++    build_kwargs = [f"urdf_version={urdf}"] if urdf else []
++    T(label, "MoveNearGoogleBakedTexInScene-v0",
++      additional_env_build_kwargs=build_kwargs,
++      **move_near_defaults)
++
++# ── Google Robot: Coke Can Variant Aggregation (3 orient, 25 eps each) ──
++for orient in orientations:
++    label = f"coke_variant_{orient}"
++    build_kwargs = []
++    if orient == "horizontal":
++        build_kwargs.append("model_ids=opened_coke_can")
++    elif orient == "vertical":
++        build_kwargs.append("model_ids=opened_coke_can_v2")
++    elif orient == "standing":
++        build_kwargs.append("model_ids=opened_coke_can")
++    T(label, "GraspSingleOpenedCokeCanDistractorInScene-v0",
++      additional_env_build_kwargs=build_kwargs,
++      obj_episode_range=[0, 25],
++      **{k: v for k, v in google_defaults.items() if k != "obj_episode_range"})
++
++# ── Google Robot: Move Near Matching & Variant ──
++T("move_near_matching", "MoveNearGoogleBakedTexInScene-v0",
++  obj_episode_range=[0, 4],
++  **{k: v for k, v in google_defaults.items() if k != "obj_episode_range"})
++
++T("move_near_variant", "MoveNearGoogleInScene-v0",
++  obj_episode_range=[0, 4],
++  **{k: v for k, v in google_defaults.items() if k != "obj_episode_range"})
++
++# ── Google Robot: Drawer tasks ──
++drawer_defaults = dict(
++    robot="google_robot_static",
++    policy_setup="google_robot",
++    unnorm_key="fractal20220817_data",
++    control_freq=3, sim_freq=513, max_episode_steps=113,
++    robot_init_xs=[0.35, 0.35],
++    robot_init_ys=[0.20, 0.21],
++    robot_init_quats=[0.0, 0.0, 0.0, 1.0],
++    obj_episode_range=[0, 5],
++)
++T("drawer_matching_open", "OpenTopDrawerCustomInScene-v0",
++  scene="dummy_drawer", **drawer_defaults)
++T("drawer_matching_close", "CloseTopDrawerCustomInScene-v0",
++  scene="dummy_drawer", **drawer_defaults)
++T("drawer_variant_open", "OpenTopDrawerCustomInScene-v0",
++  scene="frl_apartment_stage_simple", **drawer_defaults)
++T("drawer_variant_close", "CloseTopDrawerCustomInScene-v0",
++  scene="frl_apartment_stage_simple", **drawer_defaults)
++
++# ── Google Robot: Apple in drawer ──
++apple_defaults = dict(
++    robot="google_robot_static",
++    policy_setup="google_robot",
++    unnorm_key="fractal20220817_data",
++    control_freq=3, sim_freq=513, max_episode_steps=113,
++    robot_init_xs=[0.35, 0.35],
++    robot_init_ys=[0.20, 0.21],
++    robot_init_quats=[0.0, 0.0, 0.0, 1.0],
++    obj_episode_range=[0, 5],
++)
++T("apple_drawer_matching", "PlaceIntoClosedTopDrawerCustomInScene-v0",
++  scene="dummy_drawer", **apple_defaults)
++T("apple_drawer_variant", "PlaceIntoClosedTopDrawerCustomInScene-v0",
++  scene="frl_apartment_stage_simple", **apple_defaults)
++
++json.dump(tasks, open(task_json_path, "w"), indent=2)
++print(f"[INFO] Generated {len(tasks)} tasks (full suite)")
++PYEOF
++
++echo "[INFO] Task JSON: ${TASK_JSON}"
++
++# ── 启动评测 (直接调用 SimplerEnv-OpenVLA 的 native 路径) ──────────
++echo "============================================================"
++echo " eval_openvla7b.sh  |  $(date)"
++echo " Model:    ${MODEL_PATH}"
++echo " GPU:      CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-not set}"
++echo " Log:      ${LOG_FILE}"
++echo " Tasks:    ${TASK_JSON}"
++echo "============================================================"
++
++cd "${SIMPLERENV_OPENVLA_DIR}"
++
++python3 main_quant.py \
++    --native-openvla \
++    --model "${MODEL_PATH}" \
++    --simplerenv_tasks_json "${TASK_JSON}" \
++    2>&1 | tee "${LOG_FILE}"
++
++echo ""
++echo "============================================================"
++echo " Done! Results in: ${LOG_FILE}"
++echo "============================================================"
+diff --git a/main_eval.py b/main_eval.py
+new file mode 100644
+index 0000000..820f6db
+--- /dev/null
++++ b/main_eval.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""FP evaluation entrypoint for SimplerEnv-OpenVLA.
++
++Design goals:
++1) Keep a single extensible evaluation framework (task-batch, shared model cache).
++2) FP-only for now (native OpenVLA checkpoint inference).
++3) Stay outside `simpler_env/` so future backends can be integrated here.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ast
++import copy
++import json
++import os
++from types import SimpleNamespace
++from typing import Any, Dict, Iterable, List, Tuple
++
++import numpy as np
++
++from simpler_env.evaluation.maniskill2_evaluator import maniskill2_evaluator
++from simpler_env.policies.openvla.openvla_model import OpenVLAInference
++
++
++RESERVED_ENV_BUILD_KWARGS = {
++    "obs_mode",
++    "robot",
++    "sim_freq",
++    "control_mode",
++    "control_freq",
++    "max_episode_steps",
++    "scene_name",
++    "camera_cfgs",
++    "rgb_overlay_path",
++}
++
++
++def _parse_kv_list_to_dict(items: Iterable[str] | None) -> Dict[str, Any]:
++    out: Dict[str, Any] = {}
++    if not items:
++        return out
++    for kv in items:
++        if "=" not in kv:
++            raise ValueError(f"Invalid additional_env_build_kwargs entry '{kv}', expected key=value")
++        k, v = kv.split("=", 1)
++        if k in RESERVED_ENV_BUILD_KWARGS:
++            raise ValueError(f"additional_env_build_kwargs cannot override reserved key '{k}'")
++        try:
++            out[k] = ast.literal_eval(v)
++        except Exception:
++            out[k] = v
++    return out
++
++
++def _to_quat_list(flat_quats: List[float] | List[List[float]]) -> List[np.ndarray]:
++    if len(flat_quats) == 0:
++        return []
++    if isinstance(flat_quats[0], (list, tuple, np.ndarray)):
++        return [np.asarray(q, dtype=np.float64) for q in flat_quats]  # type: ignore[index]
++    if len(flat_quats) % 4 != 0:
++        raise ValueError(f"robot_init_quats length must be divisible by 4, got {len(flat_quats)}")
++    arr: List[np.ndarray] = []
++    for i in range(0, len(flat_quats), 4):
++        arr.append(np.asarray(flat_quats[i : i + 4], dtype=np.float64))
++    return arr
++
++
++def _apply_policy_runtime_config(model: OpenVLAInference, policy_setup: str, unnorm_key: str | None) -> None:
++    model.policy_setup = policy_setup
++    if policy_setup == "widowx_bridge":
++        model.sticky_gripper_num_repeat = 1
++        model.unnorm_key = "bridge_orig" if unnorm_key is None else unnorm_key
++    elif policy_setup == "google_robot":
++        model.sticky_gripper_num_repeat = 15
++        model.unnorm_key = "fractal20220817_data" if unnorm_key is None else unnorm_key
++    else:
++        raise NotImplementedError(f"Policy setup {policy_setup} not supported for OpenVLA FP eval.")
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
++    parser.add_argument("--model", type=str, required=True, help="OpenVLA checkpoint path.")
++    parser.add_argument("--policy_model", type=str, default="openvla", choices=["openvla"])
++    parser.add_argument("--policy_setup", type=str, default="google_robot", choices=["google_robot", "widowx_bridge"])
++    parser.add_argument("--unnorm_key", type=str, default=None)
++    parser.add_argument("--action_scale", type=float, default=1.0)
++    parser.add_argument("--robot", type=str, default="google_robot_static")
++    parser.add_argument("--env_name", type=str, default=None)
++    parser.add_argument("--scene_name", type=str, default=None)
++    parser.add_argument("--robot_init_xs", type=float, nargs="+", default=[0.35])
++    parser.add_argument("--robot_init_ys", type=float, nargs="+", default=[0.20])
++    parser.add_argument("--robot_init_quats", type=float, nargs="+", default=[0.0, 0.0, 0.0, 1.0])
++    parser.add_argument("--control_freq", type=int, default=3)
++    parser.add_argument("--sim_freq", type=int, default=513)
++    parser.add_argument("--max_episode_steps", type=int, default=80)
++    parser.add_argument("--rgb_overlay_path", type=str, default=None)
++    parser.add_argument("--obs_camera_name", type=str, default=None)
++    parser.add_argument("--logging_dir", type=str, default="./results")
++    parser.add_argument("--enable_raytracing", action="store_true")
++    parser.add_argument("--additional_env_save_tags", type=str, default=None)
++    parser.add_argument("--obj_variation_mode", type=str, default="episode", choices=["xy", "episode"])
++    parser.add_argument("--obj_init_xs", type=float, nargs="+", default=[])
++    parser.add_argument("--obj_init_ys", type=float, nargs="+", default=[])
++    parser.add_argument("--obj_episode_range", type=int, nargs=2, default=[0, 1])
++    parser.add_argument("--additional_env_build_kwargs", nargs="*", default=[])
++    parser.add_argument(
++        "--simplerenv_tasks_json",
++        type=str,
++        default=None,
++        help="Optional JSON list of task dicts. Task keys can override CLI fields.",
++    )
++    return parser.parse_args()
++
++
++def _load_task_list(task_json_path: str) -> list[dict]:
++    with open(task_json_path, "r", encoding="utf-8") as f:
++        payload = json.load(f)
++    if not isinstance(payload, list):
++        raise ValueError("--simplerenv_tasks_json must point to a JSON list")
++    if len(payload) == 0:
++        raise ValueError("--simplerenv_tasks_json contains an empty task list")
++    for i, item in enumerate(payload):
++        if not isinstance(item, dict):
++            raise ValueError(f"Task entry #{i} must be an object/dict")
++    return payload
++
++
++def _build_task_args(base_args: argparse.Namespace, task_dict: dict, idx: int) -> tuple[argparse.Namespace, str]:
++    args_i = copy.deepcopy(base_args)
++    label = str(task_dict.get("result_label", f"SimplerEnv FP Evaluation #{idx + 1}"))
++
++    blocked_keys = {"simplerenv_tasks_json", "policy_model", "result_label"}
++    for key, value in task_dict.items():
++        if key in blocked_keys:
++            continue
++        if not hasattr(args_i, key):
++            raise ValueError(f"Unknown task key in --simplerenv_tasks_json: {key}")
++        setattr(args_i, key, value)
++
++    return args_i, label
++
++
++def _validate_eval_args(args: argparse.Namespace) -> None:
++    if args.policy_model != "openvla":
++        raise NotImplementedError("Only --policy_model openvla is supported in FP mode.")
++    if args.action_scale <= 0:
++        raise ValueError("--action_scale must be positive")
++    if not args.env_name or not args.scene_name:
++        raise ValueError("--env_name and --scene_name are required")
++    if len(args.robot_init_quats) == 0:
++        raise ValueError("--robot_init_quats cannot be empty")
++    if args.obj_variation_mode == "xy":
++        if len(args.obj_init_xs) == 0 or len(args.obj_init_ys) == 0:
++            raise ValueError("obj_init_xs and obj_init_ys are required when --obj_variation_mode=xy")
++    else:
++        if len(args.obj_episode_range) != 2 or not (0 <= args.obj_episode_range[0] < args.obj_episode_range[1]):
++            raise ValueError("obj_episode_range must be [start, end] with 0 <= start < end")
++
++
++def _make_runtime_args(args: argparse.Namespace) -> SimpleNamespace:
++    run_args = SimpleNamespace()
++    run_args.policy_model = args.policy_model
++    run_args.ckpt_path = args.model
++    run_args.policy_setup = args.policy_setup
++    run_args.robot = args.robot
++    run_args.env_name = args.env_name
++    run_args.scene_name = args.scene_name
++    run_args.action_scale = float(args.action_scale)
++    run_args.control_freq = int(args.control_freq)
++    run_args.sim_freq = int(args.sim_freq)
++    run_args.max_episode_steps = int(args.max_episode_steps)
++    run_args.enable_raytracing = bool(args.enable_raytracing)
++    run_args.additional_env_save_tags = args.additional_env_save_tags
++    run_args.rgb_overlay_path = args.rgb_overlay_path
++    run_args.obs_camera_name = args.obs_camera_name
++    run_args.logging_dir = args.logging_dir
++    run_args.obj_variation_mode = args.obj_variation_mode
++    run_args.obj_episode_range = list(args.obj_episode_range)
++    run_args.obj_init_xs = np.asarray(args.obj_init_xs, dtype=np.float64)
++    run_args.obj_init_ys = np.asarray(args.obj_init_ys, dtype=np.float64)
++    run_args.robot_init_xs = np.asarray(args.robot_init_xs, dtype=np.float64)
++    run_args.robot_init_ys = np.asarray(args.robot_init_ys, dtype=np.float64)
++    run_args.robot_init_quats = _to_quat_list(list(args.robot_init_quats))
++
++    add_kwargs = args.additional_env_build_kwargs
++    if isinstance(add_kwargs, dict):
++        run_args.additional_env_build_kwargs = dict(add_kwargs)
++    elif isinstance(add_kwargs, list):
++        run_args.additional_env_build_kwargs = _parse_kv_list_to_dict(add_kwargs)
++    else:
++        run_args.additional_env_build_kwargs = {}
++
++    if "renderer_kwargs" not in run_args.additional_env_build_kwargs and not os.environ.get("DISPLAY"):
++        run_args.additional_env_build_kwargs["renderer_kwargs"] = {"offscreen_only": True}
++
++    return run_args
++
++
++def _normalize_eval_results(eval_results: Any) -> Tuple[np.ndarray, np.ndarray]:
++    if isinstance(eval_results, dict) and "entire" in eval_results and "partial" in eval_results:
++        entire = np.asarray(eval_results["entire"], dtype=np.float32)
++        partial = np.asarray(eval_results["partial"], dtype=np.float32)
++        return entire, partial
++
++    arr = np.asarray(eval_results, dtype=np.float32)
++    return arr, arr
++
++
++def _run_task(
++    task_args: argparse.Namespace,
++    label: str,
++    model_cache: Dict[str, OpenVLAInference],
++) -> None:
++    _validate_eval_args(task_args)
++    runtime_args = _make_runtime_args(task_args)
++    unnorm_key = task_args.unnorm_key
++
++    cache_key = str(task_args.model)
++    if cache_key not in model_cache:
++        model_cache[cache_key] = OpenVLAInference(
++            saved_model_path=task_args.model,
++            unnorm_key=unnorm_key,
++            policy_setup=task_args.policy_setup,
++            action_scale=task_args.action_scale,
++        )
++
++    model = model_cache[cache_key]
++    model.action_scale = task_args.action_scale
++    _apply_policy_runtime_config(model, task_args.policy_setup, unnorm_key)
++
++    os.makedirs(task_args.logging_dir, exist_ok=True)
++    print(f"\n[{label}]")
++    eval_results = maniskill2_evaluator(model, runtime_args)
++    entire_arr, partial_arr = _normalize_eval_results(eval_results)
++
++    n = len(entire_arr)
++    avg_entire = float(np.mean(entire_arr)) if n > 0 else 0.0
++    avg_partial = float(np.mean(partial_arr)) if n > 0 else 0.0
++    print(f"[{label}] Entire  success: {avg_entire:.4f} ({avg_entire * 100:.1f}%) — {int(np.sum(entire_arr))}/{n}")
++    print(f"[{label}] Partial success: {avg_partial:.4f} ({avg_partial * 100:.1f}%) — {int(np.sum(partial_arr))}/{n}")
++
++
++def main() -> None:
++    args = _parse_args()
++
++    if args.simplerenv_tasks_json:
++        tasks = _load_task_list(args.simplerenv_tasks_json)
++        print(f"[SimplerEnv-FP] Loaded {len(tasks)} tasks from {args.simplerenv_tasks_json}")
++    else:
++        tasks = [{}]
++
++    model_cache: Dict[str, OpenVLAInference] = {}
++    for i, task_dict in enumerate(tasks):
++        task_args, label = _build_task_args(args, task_dict, i)
++        _run_task(task_args, label, model_cache)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/main_quant.py b/main_quant.py
+new file mode 100644
+index 0000000..3226939
+--- /dev/null
++++ b/main_quant.py
+@@ -0,0 +1,208 @@
++#!/usr/bin/env python3
++"""Hybrid main_quant entry for SimplerEnv-OpenVLA.
++
++Supports two execution branches:
++
++1) Native branch (new):
++   - Keep entrypoint as `main_quant.py`
++   - Run SimplerEnv-OpenVLA's native OpenVLA evaluator stack
++   - Enabled by `--native-openvla` or env `FORCE_NATIVE_OPENVLA=1`
++
++2) Upstream forwarding branch (existing behavior):
++   - Forward to `/data5/cgk_lyy_0/zwt/SimplerEnv/openvla-oft/main_quant.py`
++"""
++
++from __future__ import annotations
++
++import argparse
++import ast
++import json
++import os
++import runpy
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Dict, Iterable, List, Tuple
++
++import numpy as np
++
++
++def _resolve_upstream_main_quant() -> Path:
++    this_dir = Path(__file__).resolve().parent
++
++    candidates = [
++        this_dir.parent / "SimplerEnv" / "openvla-oft" / "main_quant.py",
++        Path(os.environ.get("OPENVLA_MAIN_QUANT_PATH", "")) if os.environ.get("OPENVLA_MAIN_QUANT_PATH") else None,
++    ]
++
++    for c in candidates:
++        if c and c.is_file():
++            return c
++
++    raise FileNotFoundError(
++        "Cannot find upstream main_quant.py. Expected at "
++        f"{this_dir.parent / 'SimplerEnv' / 'openvla-oft' / 'main_quant.py'} "
++        "or set OPENVLA_MAIN_QUANT_PATH."
++    )
++
++
++def _parse_kv_list_to_dict(items: Iterable[str] | None) -> Dict:
++    out: Dict = {}
++    if not items:
++        return out
++    for kv in items:
++        if "=" not in kv:
++            continue
++        k, v = kv.split("=", 1)
++        try:
++            out[k] = ast.literal_eval(v)
++        except Exception:
++            out[k] = v
++    return out
++
++
++def _to_quat_list(flat_quats: List[float] | List[List[float]]) -> List[np.ndarray]:
++    if len(flat_quats) == 0:
++        return []
++    if isinstance(flat_quats[0], (list, tuple, np.ndarray)):
++        return [np.asarray(q, dtype=np.float64) for q in flat_quats]  # type: ignore[index]
++    if len(flat_quats) % 4 != 0:
++        raise ValueError(f"robot_init_quats length must be divisible by 4, got {len(flat_quats)}")
++    arr = []
++    for i in range(0, len(flat_quats), 4):
++        arr.append(np.asarray(flat_quats[i : i + 4], dtype=np.float64))
++    return arr
++
++
++def _build_eval_args_from_task(task: dict, fallback_model: str | None) -> SimpleNamespace:
++    args = SimpleNamespace()
++    args.policy_model = "openvla"
++    args.ckpt_path = task.get("model") or fallback_model
++    if not args.ckpt_path:
++        raise ValueError("Missing model path: task['model'] and --model are both empty")
++
++    args.policy_setup = task.get("policy_setup", "widowx_bridge")
++    args.robot = task.get("robot", "widowx")
++    args.env_name = task.get("env_name")
++    args.scene_name = task.get("scene_name")
++    args.action_scale = float(task.get("action_scale", 1.0))
++    args.control_freq = int(task.get("control_freq", 3))
++    args.sim_freq = int(task.get("sim_freq", 513))
++    args.max_episode_steps = int(task.get("max_episode_steps", 80))
++    args.enable_raytracing = bool(task.get("enable_raytracing", False))
++    args.additional_env_save_tags = task.get("additional_env_save_tags", None)
++    args.rgb_overlay_path = task.get("rgb_overlay_path", None)
++    args.obs_camera_name = task.get("obs_camera_name", None)
++    args.logging_dir = task.get("logging_dir", "./results")
++
++    args.obj_variation_mode = task.get("obj_variation_mode", "episode")
++    args.obj_episode_range = task.get("obj_episode_range", [0, 1])
++    args.obj_init_xs = np.asarray(task.get("obj_init_xs", []), dtype=np.float64)
++    args.obj_init_ys = np.asarray(task.get("obj_init_ys", []), dtype=np.float64)
++
++    args.robot_init_xs = np.asarray(task.get("robot_init_xs", [0.0]), dtype=np.float64)
++    args.robot_init_ys = np.asarray(task.get("robot_init_ys", [0.0]), dtype=np.float64)
++    args.robot_init_quats = _to_quat_list(task.get("robot_init_quats", [1.0, 0.0, 0.0, 0.0]))
++
++    add_kwargs = task.get("additional_env_build_kwargs", {})
++    if isinstance(add_kwargs, dict):
++        args.additional_env_build_kwargs = dict(add_kwargs)
++    elif isinstance(add_kwargs, list):
++        args.additional_env_build_kwargs = _parse_kv_list_to_dict(add_kwargs)
++    else:
++        args.additional_env_build_kwargs = {}
++
++    if not args.env_name or not args.scene_name:
++        raise ValueError(f"Invalid task: env_name/scene_name missing in {task}")
++
++    return args
++
++
++def _apply_policy_runtime_config(model: "OpenVLAInference", policy_setup: str, unnorm_key: str | None) -> None:
++    model.policy_setup = policy_setup
++    if policy_setup == "widowx_bridge":
++        model.sticky_gripper_num_repeat = 1
++        model.unnorm_key = "bridge_orig" if unnorm_key is None else unnorm_key
++    elif policy_setup == "google_robot":
++        model.sticky_gripper_num_repeat = 15
++        model.unnorm_key = "fractal20220817_data" if unnorm_key is None else unnorm_key
++    else:
++        raise NotImplementedError(
++            f"Policy setup {policy_setup} not supported for openvla native eval."
++        )
++
++
++def _run_native_openvla(tasks: List[dict], fallback_model: str | None) -> None:
++    from simpler_env.evaluation.maniskill2_evaluator import maniskill2_evaluator
++    from simpler_env.policies.openvla.openvla_model import OpenVLAInference
++
++    # Reuse heavyweight model per checkpoint to avoid OOM when task groups
++    # switch policy_setup / unnorm_key in one batched run.
++    model_cache: Dict[str, OpenVLAInference] = {}
++
++    for i, task in enumerate(tasks):
++        label = str(task.get("result_label", f"SimplerEnv Native OpenVLA #{i+1}"))
++        args = _build_eval_args_from_task(task, fallback_model)
++        unnorm_key = task.get("unnorm_key", None)
++
++        cache_key = args.ckpt_path
++        if cache_key not in model_cache:
++            model_cache[cache_key] = OpenVLAInference(
++                saved_model_path=args.ckpt_path,
++                unnorm_key=unnorm_key,
++                policy_setup=args.policy_setup,
++                action_scale=args.action_scale,
++            )
++        model = model_cache[cache_key]
++        # Update lightweight runtime configs per task while reusing model weights.
++        model.action_scale = args.action_scale
++        _apply_policy_runtime_config(model, args.policy_setup, unnorm_key)
++
++        print(f"\n[{label}]")
++        success_arr = maniskill2_evaluator(model, args)
++        n = len(success_arr)
++        avg_entire = float(np.mean(success_arr)) if n > 0 else 0.0
++        # Native evaluator没有partial定义，这里与entire对齐输出，兼容现有汇总脚本
++        avg_partial = avg_entire
++        print(f"[{label}] Entire  success: {avg_entire:.4f} ({avg_entire*100:.1f}%) — {int(np.sum(success_arr))}/{n}")
++        print(f"[{label}] Partial success: {avg_partial:.4f} ({avg_partial*100:.1f}%) — {int(np.sum(success_arr))}/{n}")
++
++
++def _dispatch_native_or_forward() -> None:
++    parser = argparse.ArgumentParser(add_help=False)
++    parser.add_argument("--native-openvla", action="store_true")
++    parser.add_argument("--simplerenv_tasks_json", type=str, default=None)
++    parser.add_argument("--model", type=str, default=None)
++    known, _ = parser.parse_known_args()
++
++    force_native = os.environ.get("FORCE_NATIVE_OPENVLA", "0") == "1"
++    if known.native_openvla or force_native:
++        if known.simplerenv_tasks_json:
++            with open(known.simplerenv_tasks_json, "r", encoding="utf-8") as f:
++                payload = json.load(f)
++            if not isinstance(payload, list):
++                raise ValueError("--simplerenv_tasks_json must be a JSON list")
++            tasks = payload
++            print(f"[SimplerEnv-Native] Loaded {len(tasks)} tasks from {known.simplerenv_tasks_json}")
++        else:
++            # Single-task minimal mode: require env/scene via CLI unknown args is not parsed here.
++            raise ValueError("Native branch requires --simplerenv_tasks_json")
++
++        _run_native_openvla(tasks=tasks, fallback_model=known.model)
++        return
++
++    upstream = _resolve_upstream_main_quant()
++    upstream_repo = upstream.parent
++    if str(upstream_repo) not in sys.path:
++        sys.path.insert(0, str(upstream_repo))
++
++    sys.argv[0] = str(upstream)
++    runpy.run_path(str(upstream), run_name="__main__")
++
++
++def main() -> None:
++    _dispatch_native_or_forward()
++
++
++if __name__ == "__main__":
++    main()

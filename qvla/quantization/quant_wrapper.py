@@ -292,7 +292,7 @@ def qwrapper(
             w_text=args.sq_w_text,
             w_action=args.sq_w_action,
             w_zero_point=bool(getattr(args, "sq_w_asym", False)),
-            a_zero_point=bool(getattr(args, "sq_a_asym", False)),
+            a_zero_point=bool(getattr(args, "sq_a_asym", True)),
         )
     elif False and args.method == "mbq":  # disabled (method not in this repo)
         wa_quant = _resolve_wa_quant(args)

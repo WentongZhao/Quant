@@ -1,0 +1,400 @@
+diff --git a/.gitignore b/.gitignore
+index 6160ebc..a14428f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,153 +1,6 @@
+-# Byte-compiled / optimized / DLL files
+-__pycache__/
+-*.py[cod]
+-*$py.class
+-
+-# C extensions
+-*.so
+-
+-# Distribution / packaging
+-.Python
+-build/
+-develop-eggs/
+-dist/
+-downloads/
+-eggs/
+-.eggs/
+-lib/
+-lib64/
+-parts/
+-sdist/
+-var/
+-wheels/
+-pip-wheel-metadata/
+-share/python-wheels/
+-*.egg-info/
+-.installed.cfg
+-*.egg
+-MANIFEST
+-
+-# PyInstaller
+-#  Usually these files are written by a python script from a template
+-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+-*.manifest
+-*.spec
+-
+-# Installer logs
+-pip-log.txt
+-pip-delete-this-directory.txt
+-
+-# Unit test / coverage reports
+-htmlcov/
+-.tox/
+-.nox/
+-.coverage
+-.coverage.*
+-.cache
+-nosetests.xml
+-coverage.xml
+-*.cover
+-*.py,cover
+-.hypothesis/
+-.pytest_cache/
+-
+-# Translations
+-*.mo
+-*.pot
+-
+-# Django stuff:
+-*.log
+-local_settings.py
+-db.sqlite3
+-db.sqlite3-journal
+-
+-# Flask stuff:
+-instance/
+-.webassets-cache
+-
+-# Scrapy stuff:
+-.scrapy
+-
+-# Sphinx documentation
+-docs/_build/
+-
+-# PyBuilder
+-target/
+-
+-# Jupyter Notebook
+-.ipynb_checkpoints
+-
+-# IPython
+-profile_default/
+-ipython_config.py
+-
+-# pyenv
+-.python-version
+-
+-# pipenv
+-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+-#   install all needed dependencies.
+-#Pipfile.lock
+-
+-# PEP 582; used by e.g. github.com/David-OConnor/pyflow
+-__pypackages__/
+-
+-# Celery stuff
+-celerybeat-schedule
+-celerybeat.pid
+-
+-# SageMath parsed files
+-*.sage.py
+-
+-# Environments
+-.env
+-.venv
+-env/
+-venv/
+-ENV/
+-env.bak/
+-venv.bak/
+-
+-# Spyder project settings
+-.spyderproject
+-.spyproject
+-
+-# Rope project settings
+-.ropeproject
+-
+-# mkdocs documentation
+-/site
+-
+-# mypy
+-.mypy_cache/
+-.dmypy.json
+-dmypy.json
+-
+-# Pyre type checker
+-.pyre/
+-
+-# Ruff
+-.ruff_cache/
+-
+-# Auth Tokens / Hidden Files
+-.hf_token
+-.wandb_api_key
+-.*_token
+-.*api_key
+-
+-# IDE Caches
+-.idea/
+-.vscode/
+-
+-# Mac OS
+-.DS_Store
+-
+-# Caches and Datasets
+-cache/
+-data/
+-
+-# Rollout videos and wandb logs
++experiments/logs/
+ rollouts/
+-wandb/
++smoothquant_logs/
++smoothquant_scales/
++*.bak
++*.fixbak
+diff --git a/quant1.sh b/quant1.sh
+index 294aa05..8b61b44 100755
+--- a/quant1.sh
++++ b/quant1.sh
+@@ -35,12 +35,11 @@ run_one_setting() {
+     local scale_dir="${SCALE_BASE}/${task}/${cfg_tag}_alpha${SQ_ALPHA}_${CALIB_TAG}"
+     mkdir -p "${scale_dir}" "${LOG_BASE}/${task}"
+ 
+-    # 1) 生成 scale（权重对称、激活非对称）
++    # 1) 生成 scale（权重对称、激活对称）
+     python main_quant.py \
+         --model "${model}" \
+         --data "${data}" \
+         --method smoothquant \
+-        --sq_a_asym \
+         --alpha "${SQ_ALPHA}" \
+         --sq_scale_mode "${SQ_SCALE_MODE}" \
+         --w_bit "${w_bit}" --a_bit "${a_bit}" --k_bit 16 --v_bit 16 \
+@@ -53,12 +52,11 @@ run_one_setting() {
+         --task_suite_name "${task}" \
+         --seed "${SEED}" |& tee "${LOG_BASE}/${task}/smoothquant_${cfg_tag}_alpha${SQ_ALPHA}_${CALIB_TAG}_${N_SAMPLES}_scale.log"
+ 
+-    # 2) pseudo quant + eval（权重对称、激活非对称）
++    # 2) pseudo quant + eval（权重对称、激活对称）
+     python main_quant.py \
+         --model "${model}" \
+         --data "${data}" \
+         --method smoothquant \
+-        --sq_a_asym \
+         --alpha "${SQ_ALPHA}" \
+         --sq_scale_mode "${SQ_SCALE_MODE}" \
+         --w_bit "${w_bit}" --a_bit "${a_bit}" --k_bit 16 --v_bit 16 \
+diff --git a/openvla_oft.egg-info/SOURCES.txt b/openvla_oft.egg-info/SOURCES.txt
+new file mode 100644
+index 0000000..50a260b
+--- /dev/null
++++ b/openvla_oft.egg-info/SOURCES.txt
+@@ -0,0 +1,131 @@
++LICENSE
++README.md
++pyproject.toml
++experiments/robot/openvla_utils.py
++experiments/robot/robot_utils.py
++experiments/robot/aloha/aloha_utils.py
++experiments/robot/aloha/constants.py
++experiments/robot/aloha/preprocess_split_aloha_data.py
++experiments/robot/aloha/real_env.py
++experiments/robot/aloha/robot_utils.py
++experiments/robot/aloha/run_aloha_eval.py
++experiments/robot/libero/libero_utils.py
++experiments/robot/libero/regenerate_libero_dataset.py
++experiments/robot/libero/run_libero_eval.py
++openvla_oft.egg-info/PKG-INFO
++openvla_oft.egg-info/SOURCES.txt
++openvla_oft.egg-info/dependency_links.txt
++openvla_oft.egg-info/requires.txt
++openvla_oft.egg-info/top_level.txt
++prismatic/__init__.py
++prismatic/py.typed
++prismatic/conf/__init__.py
++prismatic/conf/datasets.py
++prismatic/conf/models.py
++prismatic/conf/vla.py
++prismatic/extern/__init__.py
++prismatic/extern/hf/__init__.py
++prismatic/extern/hf/configuration_prismatic.py
++prismatic/extern/hf/modeling_prismatic.py
++prismatic/extern/hf/processing_prismatic.py
++prismatic/models/__init__.py
++prismatic/models/action_heads.py
++prismatic/models/film_vit_wrapper.py
++prismatic/models/load.py
++prismatic/models/materialize.py
++prismatic/models/projectors.py
++prismatic/models/registry.py
++prismatic/models/backbones/__init__.py
++prismatic/models/backbones/llm/__init__.py
++prismatic/models/backbones/llm/base_llm.py
++prismatic/models/backbones/llm/llama2.py
++prismatic/models/backbones/llm/mistral.py
++prismatic/models/backbones/llm/phi.py
++prismatic/models/backbones/llm/prompting/__init__.py
++prismatic/models/backbones/llm/prompting/base_prompter.py
++prismatic/models/backbones/llm/prompting/llama2_chat_prompter.py
++prismatic/models/backbones/llm/prompting/mistral_instruct_prompter.py
++prismatic/models/backbones/llm/prompting/phi_prompter.py
++prismatic/models/backbones/llm/prompting/vicuna_v15_prompter.py
++prismatic/models/backbones/vision/__init__.py
++prismatic/models/backbones/vision/base_vision.py
++prismatic/models/backbones/vision/clip_vit.py
++prismatic/models/backbones/vision/dinoclip_vit.py
++prismatic/models/backbones/vision/dinosiglip_vit.py
++prismatic/models/backbones/vision/dinov2_vit.py
++prismatic/models/backbones/vision/in1k_vit.py
++prismatic/models/backbones/vision/siglip_vit.py
++prismatic/models/vlas/__init__.py
++prismatic/models/vlas/openvla.py
++prismatic/models/vlms/__init__.py
++prismatic/models/vlms/base_vlm.py
++prismatic/models/vlms/prismatic.py
++prismatic/overwatch/__init__.py
++prismatic/overwatch/overwatch.py
++prismatic/preprocessing/__init__.py
++prismatic/preprocessing/download.py
++prismatic/preprocessing/materialize.py
++prismatic/preprocessing/datasets/__init__.py
++prismatic/preprocessing/datasets/datasets.py
++prismatic/training/__init__.py
++prismatic/training/materialize.py
++prismatic/training/metrics.py
++prismatic/training/train_utils.py
++prismatic/training/strategies/__init__.py
++prismatic/training/strategies/base_strategy.py
++prismatic/training/strategies/ddp.py
++prismatic/training/strategies/fsdp.py
++prismatic/util/__init__.py
++prismatic/util/batching_utils.py
++prismatic/util/data_utils.py
++prismatic/util/nn_utils.py
++prismatic/util/torch_utils.py
++prismatic/vla/__init__.py
++prismatic/vla/action_tokenizer.py
++prismatic/vla/constants.py
++prismatic/vla/materialize.py
++prismatic/vla/datasets/__init__.py
++prismatic/vla/datasets/datasets.py
++prismatic/vla/datasets/rlds/__init__.py
++prismatic/vla/datasets/rlds/dataset.py
++prismatic/vla/datasets/rlds/obs_transforms.py
++prismatic/vla/datasets/rlds/traj_transforms.py
++prismatic/vla/datasets/rlds/oxe/__init__.py
++prismatic/vla/datasets/rlds/oxe/configs.py
++prismatic/vla/datasets/rlds/oxe/materialize.py
++prismatic/vla/datasets/rlds/oxe/mixtures.py
++prismatic/vla/datasets/rlds/oxe/transforms.py
++prismatic/vla/datasets/rlds/oxe/utils/droid_utils.py
++prismatic/vla/datasets/rlds/utils/__init__.py
++prismatic/vla/datasets/rlds/utils/data_utils.py
++prismatic/vla/datasets/rlds/utils/goal_relabeling.py
++prismatic/vla/datasets/rlds/utils/task_augmentation.py
++qvla/calibration/get_libero.py
++qvla/methods/__init__.py
++qvla/methods/awq/__init__.py
++qvla/methods/awq/entry.py
++qvla/methods/awq/quantize/__init__.py
++qvla/methods/awq/quantize/auto_scale.py
++qvla/methods/awq/quantize/pre_quant.py
++qvla/methods/awq/quantize/qmodule.py
++qvla/methods/awq/quantize/quantizer.py
++qvla/methods/smoothquant/__init__.py
++qvla/methods/smoothquant/entry.py
++qvla/methods/smoothquant/quantize/gen_act_scales.py
++qvla/methods/smoothquant/quantize/quantizer.py
++qvla/methods/smoothquant/quantize/smooth.py
++qvla/quantization/__init__.py
++qvla/quantization/qlinear.py
++qvla/quantization/quant_funcs.py
++qvla/quantization/quant_wrapper.py
++qvla/utils/__init__.py
++qvla/utils/model_utils.py
++qvla/utils/registry.py
++qvla/utils/search.py
++scripts/extern/convert_prismatic_weights_to_hf.py
++scripts/extern/verify_prismatic.py
++vla-scripts/deploy.py
++vla-scripts/finetune.py
++vla-scripts/merge_lora_weights_and_save.py
++vla-scripts/extern/convert_openvla_weights_to_hf.py
++vla-scripts/extern/verify_openvla.py
+\ No newline at end of file
+diff --git a/openvla_oft.egg-info/dependency_links.txt b/openvla_oft.egg-info/dependency_links.txt
+new file mode 100644
+index 0000000..8b13789
+--- /dev/null
++++ b/openvla_oft.egg-info/dependency_links.txt
+@@ -0,0 +1 @@
++
+diff --git a/openvla_oft.egg-info/requires.txt b/openvla_oft.egg-info/requires.txt
+new file mode 100644
+index 0000000..bb3d177
+--- /dev/null
++++ b/openvla_oft.egg-info/requires.txt
+@@ -0,0 +1,38 @@
++accelerate>=0.25.0
++draccus==0.8.0
++einops
++huggingface_hub
++json-numpy
++jsonlines
++matplotlib
++peft==0.11.1
++protobuf
++rich
++sentencepiece==0.1.99
++timm==0.9.10
++tokenizers==0.19.1
++torch==2.2.0
++torchvision==0.17.0
++torchaudio==2.2.0
++transformers @ git+https://github.com/moojink/transformers-openvla-oft.git
++wandb
++tensorflow==2.15.0
++tensorflow_datasets==4.9.3
++tensorflow_graphics==2021.12.3
++dlimp @ git+https://github.com/moojink/dlimp_openvla
++diffusers==0.30.3
++imageio
++uvicorn
++fastapi
++json-numpy
++
++[dev]
++black>=24.2.0
++gpustat
++ipython
++pre-commit
++ruff>=0.2.2
++
++[sagemaker]
++boto3
++sagemaker
+diff --git a/openvla_oft.egg-info/top_level.txt b/openvla_oft.egg-info/top_level.txt
+new file mode 100644
+index 0000000..4311d4d
+--- /dev/null
++++ b/openvla_oft.egg-info/top_level.txt
+@@ -0,0 +1,7 @@
++experiments
++prismatic
++qvla
++scripts
++smoothquant_logs
++smoothquant_scales
++vla-scripts
+diff --git a/quant.sh b/quant.sh
+new file mode 100644
+index 0000000..e69de29

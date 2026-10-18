@@ -282,7 +282,7 @@ def pseudo_quantize_model_weight_act(
     w_bit,
     a_bit,
     w_zero_point: bool = False,
-    a_zero_point: bool = False,
+    a_zero_point: bool = True,
 ):
     layers = get_blocks(model)
     for i in tqdm(range(len(layers)), desc="pseudo weight activation quantization..."):
@@ -333,7 +333,7 @@ def pseudo_quantize_vision_weight_act(
     w_bit,
     a_bit,
     w_zero_point: bool = False,
-    a_zero_point: bool = False,
+    a_zero_point: bool = True,
 ):
     replaced = 0
     for _, featurizer in _get_vision_featurizers(model):

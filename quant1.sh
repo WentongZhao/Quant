@@ -6,7 +6,7 @@ set -euo pipefail
 # x 2 settings (w4a4kv16, w8a8kv16)
 
 # 项目根目录（用于保存日志与scale）
-ICML_DIR=/root/openvla-oft
+ICML_DIR=/root/autodl-tmp/Quant
 
 # Fixed GPU as requested
 export CUDA_VISIBLE_DEVICES=0
@@ -40,7 +40,7 @@ run_one_setting() {
         --model "${model}" \
         --data "${data}" \
         --method smoothquant \
-        --sq_a_asym \
+        --sq_a_asym --no-sq_w_asym \
         --alpha "${SQ_ALPHA}" \
         --sq_scale_mode "${SQ_SCALE_MODE}" \
         --w_bit "${w_bit}" --a_bit "${a_bit}" --k_bit 16 --v_bit 16 \
@@ -58,7 +58,7 @@ run_one_setting() {
         --model "${model}" \
         --data "${data}" \
         --method smoothquant \
-        --sq_a_asym \
+        --sq_a_asym --no-sq_w_asym \
         --alpha "${SQ_ALPHA}" \
         --sq_scale_mode "${SQ_SCALE_MODE}" \
         --w_bit "${w_bit}" --a_bit "${a_bit}" --k_bit 16 --v_bit 16 \

@@ -40,7 +40,7 @@ def smoothquant_entry(
     w_text: float = 1.0,
     w_action: float = 1.0,
     w_zero_point: bool = False,
-    a_zero_point: bool = False,
+    a_zero_point: bool = True,
 ):
     '''
     SmoothQuant entrypoint for OpenVLA.

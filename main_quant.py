@@ -34,6 +34,7 @@ try:
 except ModuleNotFoundError:
     patch_action_head_unrotate_r_res = None  # OSTQuant not present in this repo
 from libero.libero import benchmark
+from evaluation.libero import evaluate_libero as _evaluate_libero
 
 def _set_reproducibility(seed: int) -> None:
     import random as _py_random
@@ -59,12 +60,22 @@ def _build_generate_config(args) -> GenerateConfig:
         task_suite_name=args.task_suite_name,
         num_trials_per_task=args.num_trials_per_task,
         seed=args.seed,
+        local_log_dir=args.local_log_dir,
+        run_id_note=args.run_id_note,
+        fail_on_episode_error=args.eval_mode is not None,
     )
 
 
 def parse_quant_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--config", default="", help="YAML config; when set, CLI args are ignored.")
+    parser.add_argument("--model_backend", default="openvla_oft", choices=["openvla_oft"])
+    parser.add_argument("--eval_mode", default=None, choices=["libero_fp", "libero_quant"])
+    parser.add_argument("--results_json", default=None, help="Write per-task progress and final metrics atomically.")
+    parser.add_argument("--eval_task_ids", type=int, nargs="+", default=None, help="Optional task subset for validation.")
+    parser.add_argument("--local_log_dir", default="./experiments/logs")
+    parser.add_argument("--run_id_note", default=None)
+    parser.add_argument("--use_l1_regression", action=argparse.BooleanOptionalAction, default=True)
 
     def _parse_bool(v):
         if isinstance(v, bool):
@@ -79,10 +90,10 @@ def parse_quant_args() -> argparse.Namespace:
         raise argparse.ArgumentTypeError(f"Expected a boolean value, got {v!r}")
 
     # Model / data
-    parser.add_argument("--model", required=True, help="OpenVLA checkpoint path or HF repo id.")
+    parser.add_argument("--model", default=None, help="OpenVLA checkpoint path or HF repo id; may be supplied in --config.")
     parser.add_argument(
         "--data",
-        required=True,
+        default="",
         help="TFDS version dir for LIBERO RLDS data (must contain dataset_info.json), e.g. .../libero_spatial_no_noops/1.0.0",
     )
     parser.add_argument("--n_samples", type=int, default=128)
@@ -93,7 +104,7 @@ def parse_quant_args() -> argparse.Namespace:
     )
     parser.add_argument("--unnorm_key", type=str, default=None, help="Choose norm_stats key (default: first one).")
     parser.add_argument("--num_images", type=int, default=2, help="#images per sample (primary + wrist).")
-    parser.add_argument("--use_proprio", action="store_true", default=True)
+    parser.add_argument("--use_proprio", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--deterministic", action="store_true", help="Disable dataset shuffling.")
     parser.add_argument(
         "--calib_sampling",
@@ -167,12 +178,14 @@ def parse_quant_args() -> argparse.Namespace:
     parser.add_argument("--sq_w_action", type=float, default=1.0, help="Token weight for action_mask (weighted_max).")
     parser.add_argument(
         "--sq_w_asym",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Use asymmetric weight quantization (zero-point) for SmoothQuant.",
     )
     parser.add_argument(
         "--sq_a_asym",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Use asymmetric activation quantization (zero-point) for SmoothQuant.",
     )
     parser.add_argument("--reweight", action="store_true")
@@ -606,7 +619,35 @@ def cli_quant(args: Union[argparse.Namespace, None] = None) -> None:
         cli_quant_single(cfg_args)
 
 
+def _validate_libero_mode(args: argparse.Namespace) -> None:
+    if not args.model:
+        raise ValueError("--model is required (CLI or config).")
+    if getattr(args, "model_backend", "openvla_oft") != "openvla_oft":
+        raise ValueError("This LIBERO backend currently supports only openvla_oft.")
+    if not args.use_l1_regression:
+        raise ValueError("This verified OFT backend requires --use_l1_regression.")
+    if args.num_trials_per_task <= 0:
+        raise ValueError("--num_trials_per_task must be positive.")
+    mode = getattr(args, "eval_mode", None)
+    if mode not in {None, "libero_fp", "libero_quant"}:
+        raise ValueError(f"Unsupported LIBERO evaluation mode: {mode}")
+    if mode == "libero_fp":
+        if args.pseudo_quant or args.run_process:
+            raise ValueError("libero_fp cannot use --pseudo_quant or --run_process.")
+        args.eval_libero = True
+    else:
+        if not args.data:
+            raise ValueError("Quantization/calibration requires --data; libero_fp does not.")
+        if mode == "libero_quant":
+            args.eval_libero = True
+        if args.eval_libero and args.method == "smoothquant" and not args.pseudo_quant:
+            raise ValueError("SmoothQuant evaluation requires --pseudo_quant; --run_process alone only saves scales.")
+
+
+
+
 def cli_quant_single(args: argparse.Namespace) -> None:
+    _validate_libero_mode(args)
     # torchrun/DDP: ensure each rank uses its own local GPU (CUDA_VISIBLE_DEVICES remaps to cuda:0..).
     if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -634,6 +675,11 @@ def cli_quant_single(args: argparse.Namespace) -> None:
         proprio_projector.eval()
     if action_head is not None:
         action_head.eval()
+
+    if args.eval_mode == "libero_fp":
+        print("[LIBERO FP] Evaluating the original model; calibration and qwrapper are skipped.", flush=True)
+        _evaluate_libero(args, cfg, vla, processor, action_head, proprio_projector, quantized=False)
+        return
 
     # --- Optional pre-eval (float, before quantization) ---
     if args.method == "ostquant" and bool(getattr(args, "pre_eval", False)) and args.eval_libero:
@@ -717,52 +763,7 @@ def cli_quant_single(args: argparse.Namespace) -> None:
         patch_action_head_unrotate_r_res(action_head, vla_model=vla)
     # Optional LIBERO evaluation with the quantized model
     if args.eval_libero:
-        import torch.distributed as dist
-
-        # For multi-process OSTQuant training under torchrun, only run final eval on rank0.
-        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-            return
-        # The model is already quantized in-place. Just run eval using the official loop.
-        validate_config(cfg)
-        set_seed_everywhere(cfg.seed)
-        resize_size = get_image_resize_size(cfg)
-
-        # Reuse action_head / proprio_projector / processor / noisy_action_projector
-        noisy_action_projector = None
-        if cfg.use_diffusion:
-            noisy_action_projector = get_noisy_action_projector(cfg, vla.llm_dim)
-
-        # Setup logging
-        log_file, _, _ = setup_logging(cfg)
-
-        # Initialize LIBERO task suite
-        benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict[cfg.task_suite_name]()
-        num_tasks = task_suite.n_tasks
-
-        total_episodes, total_successes = 0, 0
-        for task_id in tqdm.tqdm(range(num_tasks)):
-            total_episodes, total_successes = run_task(
-                cfg,
-                task_suite,
-                task_id,
-                vla,
-                resize_size,
-                processor,
-                action_head,
-                proprio_projector,
-                noisy_action_projector,
-                total_episodes,
-                total_successes,
-                log_file,
-            )
-
-        final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
-        print(f"[Quantized Eval] Total episodes: {total_episodes}, successes: {total_successes}, "
-              f"success_rate: {final_success_rate:.4f} ({final_success_rate*100:.1f}%)")
-
-        if log_file:
-            log_file.close()
+        _evaluate_libero(args, cfg, vla, processor, action_head, proprio_projector, quantized=True)
 
 
 if __name__ == "__main__":

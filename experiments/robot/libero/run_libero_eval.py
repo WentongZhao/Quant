@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class GenerateConfig:
     # fmt: off
+    fail_on_episode_error: bool = False             # Unified evaluation reports runtime errors separately from task failures
 
     #################################################################################################################
     # Model-specific parameters
@@ -355,6 +356,8 @@ def run_episode(
 
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
+        if cfg.fail_on_episode_error:
+            raise
 
     return success, replay_images
 

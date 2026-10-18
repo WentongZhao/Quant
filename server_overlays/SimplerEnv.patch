@@ -1,0 +1,929 @@
+diff --git a/simpler_env/__init__.py b/simpler_env/__init__.py
+index e8b8aa5..c6005be 100644
+--- a/simpler_env/__init__.py
++++ b/simpler_env/__init__.py
+@@ -75,8 +75,9 @@ def make(task_name, **kwargs):
+     """Creates simulated eval environment from task name."""
+     assert task_name in ENVIRONMENTS, f"Task {task_name} is not supported. Environments: \n {ENVIRONMENTS}"
+     env_name, env_kwargs = ENVIRONMENT_MAP[task_name]
++    env_kwargs = dict(env_kwargs)
+     
+-    env_kwargs["obs_mode"] = "rgbd",
++    env_kwargs["obs_mode"] = "rgbd"
+     env_kwargs["prepackaged_config"] = True
+ 
+     for key, value in kwargs.items():
+diff --git a/simpler_env/evaluation/maniskill2_evaluator.py b/simpler_env/evaluation/maniskill2_evaluator.py
+index 99a788e..4530252 100644
+--- a/simpler_env/evaluation/maniskill2_evaluator.py
++++ b/simpler_env/evaluation/maniskill2_evaluator.py
+@@ -2,6 +2,7 @@
+ Evaluate a model on ManiSkill2 environment.
+ """
+ 
++import inspect
+ import os
+ 
+ import numpy as np
+@@ -12,6 +13,21 @@ from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_ob
+ from simpler_env.utils.visualization import write_video
+ 
+ 
++RESERVED_ENV_BUILD_KWARGS = frozenset(
++    {
++        "obs_mode",
++        "robot",
++        "sim_freq",
++        "control_mode",
++        "control_freq",
++        "max_episode_steps",
++        "scene_name",
++        "camera_cfgs",
++        "rgb_overlay_path",
++    }
++)
++
++
+ def run_maniskill2_eval_single_episode(
+     model,
+     ckpt_path,
+@@ -36,9 +52,28 @@ def run_maniskill2_eval_single_episode(
+     additional_env_save_tags=None,
+     logging_dir="./results",
+ ):
++    def _get_env_attr(env_obj, attr_name):
++        # Gymnasium wrapper-safe access to avoid deprecation warnings.
++        if hasattr(env_obj, "get_wrapper_attr"):
++            try:
++                return env_obj.get_wrapper_attr(attr_name)
++            except Exception:
++                pass
++        return getattr(env_obj.unwrapped, attr_name)
++
++    def _call_env_method(env_obj, method_name, *m_args, **m_kwargs):
++        method = _get_env_attr(env_obj, method_name)
++        return method(*m_args, **m_kwargs)
+ 
+     if additional_env_build_kwargs is None:
+         additional_env_build_kwargs = {}
++    conflicting_keys = RESERVED_ENV_BUILD_KWARGS.intersection(additional_env_build_kwargs)
++    if conflicting_keys:
++        conflicting_keys_str = ", ".join(sorted(conflicting_keys))
++        raise ValueError(
++            "additional_env_build_kwargs cannot override reserved env build kwargs: "
++            f"{conflicting_keys_str}"
++        )
+ 
+     # Create environment
+     kwargs = dict(
+@@ -84,14 +119,14 @@ def run_maniskill2_eval_single_episode(
+         }
+     obs, _ = env.reset(options=env_reset_options)
+     # for long-horizon environments, we check if the current subtask is the final subtask
+-    is_final_subtask = env.is_final_subtask() 
++    is_final_subtask = _call_env_method(env, "is_final_subtask")
+ 
+     # Obtain language instruction
+     if instruction is not None:
+         task_description = instruction
+     else:
+         # get default language instruction
+-        task_description = env.get_language_instruction()
++        task_description = _call_env_method(env, "get_language_instruction")
+     print(task_description)
+ 
+     # Initialize logging
+@@ -102,21 +137,36 @@ def run_maniskill2_eval_single_episode(
+ 
+     # Initialize model
+     model.reset(task_description)
++    step_parameters = inspect.signature(model.step).parameters
++    step_has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in step_parameters.values())
++    step_call_kwargs = {}
++    if step_has_var_kwargs or "obs" in step_parameters:
++        step_call_kwargs["obs"] = None  # populated at each step
++    if step_has_var_kwargs or "obs_camera_name" in step_parameters:
++        step_call_kwargs["obs_camera_name"] = obs_camera_name
+ 
+     timestep = 0
+     success = "failure"
+ 
+     # Step the environment
++    # NOTE: do NOT check `done` here – matching reference evaluator behavior.
++    # The env may flip done back to False (e.g., object grasped then dropped),
++    # so we must keep stepping until truncated (max_episode_steps reached).
+     while not (predicted_terminated or truncated):
+         # step the model; "raw_action" is raw model action output; "action" is the processed action to be sent into maniskill env
+-        raw_action, action = model.step(image, task_description)
++        if step_call_kwargs:
++            if "obs" in step_call_kwargs:
++                step_call_kwargs["obs"] = obs
++            raw_action, action = model.step(image, task_description, **step_call_kwargs)
++        else:
++            raw_action, action = model.step(image, task_description)
+         predicted_actions.append(raw_action)
+         predicted_terminated = bool(action["terminate_episode"][0] > 0)
+         if predicted_terminated:
+             if not is_final_subtask:
+                 # advance the environment to the next subtask
+                 predicted_terminated = False
+-                env.advance_to_next_subtask()
++                _call_env_method(env, "advance_to_next_subtask")
+ 
+         # step the environment
+         obs, reward, done, truncated, info = env.step(
+@@ -124,11 +174,11 @@ def run_maniskill2_eval_single_episode(
+         )
+         
+         success = "success" if done else "failure"
+-        new_task_description = env.get_language_instruction()
++        new_task_description = _call_env_method(env, "get_language_instruction")
+         if new_task_description != task_description:
+             task_description = new_task_description
+             print(task_description)
+-        is_final_subtask = env.is_final_subtask()
++        is_final_subtask = _call_env_method(env, "is_final_subtask")
+ 
+         print(timestep, info)
+ 
+@@ -160,6 +210,7 @@ def run_maniskill2_eval_single_episode(
+     r, p, y = quat2euler(robot_init_quat)
+     video_path = f"{ckpt_path_basename}/{scene_name}/{control_mode}/{env_save_name}/rob_{robot_init_x}_{robot_init_y}_rot_{r:.3f}_{p:.3f}_{y:.3f}_rgb_overlay_{rgb_overlay_path_str}/{video_name}"
+     video_path = os.path.join(logging_dir, video_path)
++    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+     write_video(video_path, images, fps=5)
+ 
+     # save action trajectory
+@@ -169,12 +220,33 @@ def run_maniskill2_eval_single_episode(
+     action_path = action_root + os.path.basename(action_path)
+     model.visualize_epoch(predicted_actions, images, save_path=action_path)
+ 
+-    return success == "success"
++    # Determine partial success from episode_stats.
++    # Common partial-success keys across different envs:
++    #   - is_src_obj_grasped (pick, move_near, bridge tasks)
++    #   - is_drawer_open / is_drawer_closed (drawer tasks)
++    #   - consecutive_grasp (some bridge tasks)
++    partial_success = False
++    for key in ("is_src_obj_grasped", "consecutive_grasp",
++                "is_drawer_open", "is_drawer_closed"):
++        val = episode_stats.get(key)
++        if val is not None:
++            partial_success = bool(val)
++            break
++    # If task succeeded entirely, partial is also True
++    if success == "success":
++        partial_success = True
++
++    return {"entire": success == "success", "partial": partial_success}
+ 
+ 
+ def maniskill2_evaluator(model, args):
+-    control_mode = get_robot_control_mode(args.robot, args.policy_model)
+-    success_arr = []
++    # Allow override of control_mode; if not provided, infer from robot + policy_model
++    control_mode = getattr(args, "control_mode", None)
++    if control_mode is None:
++        policy_model = getattr(args, "policy_model", "openvla_quant")
++        control_mode = get_robot_control_mode(args.robot, policy_model)
++    entire_arr = []
++    partial_arr = []
+ 
+     # run inference
+     for robot_init_x in args.robot_init_xs:
+@@ -203,17 +275,19 @@ def maniskill2_evaluator(model, args):
+                 if args.obj_variation_mode == "xy":
+                     for obj_init_x in args.obj_init_xs:
+                         for obj_init_y in args.obj_init_ys:
+-                            success_arr.append(
+-                                run_maniskill2_eval_single_episode(
+-                                    obj_init_x=obj_init_x,
+-                                    obj_init_y=obj_init_y,
+-                                    **kwargs,
+-                                )
++                            result = run_maniskill2_eval_single_episode(
++                                obj_init_x=obj_init_x,
++                                obj_init_y=obj_init_y,
++                                **kwargs,
+                             )
++                            entire_arr.append(result["entire"])
++                            partial_arr.append(result["partial"])
+                 elif args.obj_variation_mode == "episode":
+                     for obj_episode_id in range(args.obj_episode_range[0], args.obj_episode_range[1]):
+-                        success_arr.append(run_maniskill2_eval_single_episode(obj_episode_id=obj_episode_id, **kwargs))
++                        result = run_maniskill2_eval_single_episode(obj_episode_id=obj_episode_id, **kwargs)
++                        entire_arr.append(result["entire"])
++                        partial_arr.append(result["partial"])
+                 else:
+                     raise NotImplementedError()
+ 
+-    return success_arr
++    return {"entire": entire_arr, "partial": partial_arr}
+diff --git a/simpler_env/utils/env/env_builder.py b/simpler_env/utils/env/env_builder.py
+index 6063d69..86b4cf6 100644
+--- a/simpler_env/utils/env/env_builder.py
++++ b/simpler_env/utils/env/env_builder.py
+@@ -1,8 +1,15 @@
++import os
++
+ import gymnasium as gym
+ import mani_skill2_real2sim.envs
+ 
+ 
+ def build_maniskill2_env(env_name, **kwargs):
++    # Headless jobs should explicitly request offscreen rendering so SAPIEN
++    # does not try to create a GLFW window when DISPLAY is unavailable.
++    if "renderer_kwargs" not in kwargs and not os.environ.get("DISPLAY"):
++        kwargs["renderer_kwargs"] = {"offscreen_only": True}
++
+     # Create environment
+     if kwargs.get("rgb_overlay_path", None) is not None:
+         if kwargs.get("rgb_overlay_cameras", None) is None:
+diff --git a/simpler_env/utils/env/observation_utils.py b/simpler_env/utils/env/observation_utils.py
+index 0526842..f2615f7 100644
+--- a/simpler_env/utils/env/observation_utils.py
++++ b/simpler_env/utils/env/observation_utils.py
+@@ -1,9 +1,19 @@
+ def get_image_from_maniskill2_obs_dict(env, obs, camera_name=None):
+     # obtain image from observation dictionary returned by ManiSkill2 environment
++    def _get_env_attr(env_obj, attr_name):
++        # Gymnasium wrapper-safe access to avoid deprecation warnings.
++        if hasattr(env_obj, "get_wrapper_attr"):
++            try:
++                return env_obj.get_wrapper_attr(attr_name)
++            except Exception:
++                pass
++        return getattr(env_obj.unwrapped, attr_name)
++
+     if camera_name is None:
+-        if "google_robot" in env.robot_uid:
++        robot_uid = _get_env_attr(env, "robot_uid")
++        if "google_robot" in robot_uid:
+             camera_name = "overhead_camera"
+-        elif "widowx" in env.robot_uid:
++        elif "widowx" in robot_uid:
+             camera_name = "3rd_view_camera"
+         else:
+             raise NotImplementedError()
+diff --git a/SIMPLENV_INTEGRATION_GUIDE.md b/SIMPLENV_INTEGRATION_GUIDE.md
+new file mode 100644
+index 0000000..04ff33f
+--- /dev/null
++++ b/SIMPLENV_INTEGRATION_GUIDE.md
+@@ -0,0 +1,197 @@
++# SimplerEnv 评测集成指南
++
++本文档描述如何将量化的 OpenVLA 模型直接在 SimplerEnv 中进行评测。
++
++## 改造概览
++
++### 前置依赖
++
++- SimplerEnv 环境正确安装
++- OpenVLA-OFT 模型准备好
++- ManiSkill2_real2sim 环境可用
++
++### 核心改动
++
++#### 1. 新增 Adapter 类
++
++**文件**: `simpler_env/policies/openvla/openvla_model.py`
++
++实现了 `OpenVLAQuantizedInference` 类，直接接收内存中的量化模型对象（无需重新加载）：
++
++```python
++model = OpenVLAQuantizedInference(
++    vla=vla,                          # 量化后的 VLA 模型
++    processor=processor,               # VLA 处理器
++    cfg=cfg,                          # 配置对象
++    action_head=action_head,          # 可选的动作头
++    proprio_projector=proprio_projector,  # 可选的本体感觉投影
++    policy_setup="google_robot",      # google_robot 或 widowx_bridge
++    action_scale=1.0,                 # 动作缩放因子
++)
++```
++
++核心方法：
++- `reset(task_description)`: 重置策略状态
++- `step(image, task_description=None)`: 执行一步策略
++  - 返回: `(raw_action, action)`
++  - `action` 包含必要的关键字：
++    - `world_vector`: (3,) XYZ 平移
++    - `rot_axangle`: (3,) 轴-角旋转
++    - `gripper`: (1,) 夹爪动作
++    - `terminate_episode`: (1,) 终止信号
++- `visualize_epoch(predicted_actions, images, save_path)`: 可视化轨迹
++
++#### 2. 修改量化入口脚本
++
++**文件**: `openvla-oft/main_quant.py`
++
++**新增导入**:
++```python
++from simpler_env.evaluation.maniskill2_evaluator import maniskill2_evaluator
++from simpler_env.policies.openvla import OpenVLAQuantizedInference
++```
++
++**扩展参数**（均以 `--` 开头）:
++- `--eval_simplerenv`: 启用 SimplerEnv 评测
++- `--policy_model`: 策略模型名称（默认: openvla_quant）
++- `--policy_setup`: 策略配置（google_robot 或 widowx_bridge）
++- `--action_scale`: 动作缩放因子（默认: 1.0）
++- `--robot`: 机器人类型（默认: google_robot_static）
++- `--env_name`: 环境名称（必需）
++- `--scene_name`: 场景名称（默认: google_pick_coke_can_1_v4）
++- `--robot_init_xs`, `--robot_init_ys`: 机器人初始位置列表
++- `--robot_init_quats`: 机器人初始四元数（扁平化: q0 q1 q2 q3 ...）
++- `--control_freq`, `--sim_freq`, `--max_episode_steps`: 环境参数
++- `--rgb_overlay_path`: RGB 覆盖图像路径
++- `--obs_camera_name`: 观察相机名称
++- `--logging_dir`: 日志目录（默认: ./results）
++- `--enable_raytracing`: 启用光线追踪
++- `--additional_env_save_tags`: 额外的环保存标签
++- `--obj_variation_mode`: 物体变化模式（xy 或 episode）
++- `--obj_init_xs`, `--obj_init_ys`: 物体初始位置（xy 模式）
++- `--obj_episode_range`: 物体 episode 范围 [start, end]
++- `--additional_env_build_kwargs`: 额外环境构建关键字
++
++**主要改动**（在 `cli_quant_single()` 中）:
++- 量化后（在 `eval_libero` 分支之后）添加 SimplerEnv 评测分支
++- 创建 adapter 实例
++- 调用 `maniskill2_evaluator(model, args)`
++- 输出平均成功率
++
++#### 3. 最小化修改 SimplerEnv Evaluator
++
++**文件**: `simpler_env/evaluation/maniskill2_evaluator.py`
++
++支持 `control_mode` override：
++
++```python
++# 允许从 args 中读取 control_mode，否则推导
++control_mode = getattr(args, "control_mode", None)
++if control_mode is None:
++    control_mode = get_robot_control_mode(args.robot, args.policy_model)
++```
++
++这样可以支持新的 `policy_model="openvla_quant"` 而无需修改推导逻辑。
++
++## 使用示例
++
++### 基本用法
++
++```bash
++python openvla-oft/main_quant.py \
++    --model "path/to/openvla/checkpoint" \
++    --data "path/to/libero/data" \
++    --method mbq \
++    --w_bit 8 \
++    --a_bit 16 \
++    --eval_simplerenv \
++    --env_name "OpenDrawerCustomInScene-v0" \
++    --scene_name "dummy_drawer" \
++    --robot "google_robot_static" \
++    --robot_init_xs 0.65 0.75 \
++    --robot_init_ys 0.0 0.2 \
++    --robot_init_quats 1.0 0.0 0.0 0.0 \
++    --max_episode_steps 113 \
++    --policy_setup "google_robot" \
++    --logging_dir "./results"
++```
++
++### 带 LIBERO 和 SimplerEnv 的联合评测
++
++```bash
++python openvla-oft/main_quant.py \
++    --model "path/to/model" \
++    --data "path/to/libero/data" \
++    --method mbq \
++    --eval_libero \
++    --eval_simplerenv \
++    --env_name "OpenDrawerCustomInScene-v0" \
++    --obj_variation_mode "episode" \
++    --obj_episode_range 0 10
++```
++
++### 仅 SimplerEnv 评测
++
++```bash
++python openvla-oft/main_quant.py \
++    --model "path/to/model" \
++    --data "path/to/libero/data" \
++    --eval_simplerenv \
++    --env_name "PlaceIntoClosedTopDrawerCustomInScene-v0" \
++    --scene_name "frl_apartment_stage_simple" \
++    --robot_init_xs 0.65 \
++    --robot_init_ys -0.2 0.0 0.2 \
++    --obj_variation_mode "xy" \
++    --obj_init_xs -0.35 -0.2 \
++    --obj_init_ys 0.0 0.2 0.4
++```
++
++## 关键特性
++
++✅ **内存中的模型**：量化后的模型保留在内存中，无需重新加载 checkpoint
++
++✅ **统一入口**：所有量化和评测通过 `main_quant.py` 进行
++
++✅ **灵活评测**：支持多种变化模式（机器人位姿、物体位置）
++
++✅ **兼容性**：支持多种策略配置（google_robot、widowx_bridge）
++
++✅ **可选 LIBERO**：可同时运行或单独运行 LIBERO 评测
++
++## 工作流程
++
++```
++CLI/YAML 参数
++    ↓
++加载预训练模型 (get_vla, get_processor, etc.)
++    ↓
++获取校准数据 (get_libero_calib_dataset)
++    ↓
++qwrapper 执行量化
++    ↓
++可选：LIBERO 评测
++    ↓
++[新增] 创建 OpenVLAQuantizedInference adapter
++    ↓
++[新增] 调用 maniskill2_evaluator 进行 SimplerEnv 评测
++    ↓
++输出结果 (平均成功率等)
++```
++
++## 调试建议
++
++1. **检查环境**：确保 `--env_name` 在 SimplerEnv 中已注册
++2. **检查参数维度**：`robot_init_quats` 必须 4 的倍数
++3. **检查数据路径**：`--rgb_overlay_path` 和 `--data` 必须存在
++4. **GPU 内存**：如有OOM，可调整 `--tf_memory_limit`
++
++## 常见问题
++
++**Q: 为什么不直接用 `main_inference.py`？**
++A: 因为 `main_inference.py` 会从 checkpoint 重新加载模型，导致丢失内存中的量化对象。此方案直接传递内存中的对象。
++
++**Q: Adapter 是否支持所有 policy_setup？**
++A: 目前支持 `google_robot` 和 `widowx_bridge`。新的 setup 需要在 adapter 中补充夹爪处理逻辑。
++
++**Q: 能否只跑某个 task 而不是所有变化？**
++A: 可以。通过 `--robot_init_xs 0.65`、`--robot_init_ys 0.0` 和 `--obj_episode_range 0 1` 限制。
+diff --git a/qvla/eval/__init__.py b/qvla/eval/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/simpler_env/policies/openvla/__init__.py b/simpler_env/policies/openvla/__init__.py
+new file mode 100644
+index 0000000..8d13ecf
+--- /dev/null
++++ b/simpler_env/policies/openvla/__init__.py
+@@ -0,0 +1 @@
++from .openvla_model import OpenVLAQuantizedInference
+diff --git a/simpler_env/policies/openvla/openvla_model.py b/simpler_env/policies/openvla/openvla_model.py
+new file mode 100644
+index 0000000..f7b8826
+--- /dev/null
++++ b/simpler_env/policies/openvla/openvla_model.py
+@@ -0,0 +1,443 @@
++"""
++OpenVLA Quantized Inference Adapter for SimplerEnv
++Wraps a quantized in-memory VLA model for use with maniskill2_evaluator.
++"""
++
++from collections import deque
++from typing import Any, Dict, Optional, Sequence
++import warnings
++
++import matplotlib.pyplot as plt
++import numpy as np
++import torch
++from PIL import Image
++from transforms3d.euler import euler2axangle
++
++try:
++    from prismatic.vla.constants import NUM_ACTIONS_CHUNK
++except ImportError:
++    NUM_ACTIONS_CHUNK = 1  # Base model: one action per inference step
++
++
++_OPENVLA_PREPROCESS_IMPORTED = False
++_OPENVLA_PREPROCESS_FNS = None
++
++
++def _get_openvla_preprocess_fns():
++    global _OPENVLA_PREPROCESS_IMPORTED, _OPENVLA_PREPROCESS_FNS
++    if not _OPENVLA_PREPROCESS_IMPORTED:
++        _OPENVLA_PREPROCESS_IMPORTED = True
++        try:
++            from experiments.robot.openvla_utils import normalize_proprio, prepare_images_for_vla
++
++            _OPENVLA_PREPROCESS_FNS = {
++                "prepare_images_for_vla": prepare_images_for_vla,
++                "normalize_proprio": normalize_proprio,
++            }
++        except Exception:
++            _OPENVLA_PREPROCESS_FNS = None
++    return _OPENVLA_PREPROCESS_FNS
++
++
++def _fallback_prepare_images_for_vla(images: Sequence[np.ndarray]) -> Sequence[Image.Image]:
++    processed = []
++    for image in images:
++        if not isinstance(image, np.ndarray):
++            raise TypeError(f"Unsupported image type for VLA preprocessing: {type(image)!r}")
++        if image.dtype != np.uint8:
++            image = np.clip(image, 0, 255).astype(np.uint8)
++        if image.ndim != 3 or image.shape[-1] != 3:
++            raise ValueError(f"Expected image shape (H, W, 3), got {image.shape!r}")
++        processed.append(Image.fromarray(image).convert("RGB"))
++    return processed
++
++
++class OpenVLAQuantizedInference:
++    """
++    Adapter for quantized OpenVLA model to be used with SimplerEnv's maniskill2_evaluator.
++
++    This class wraps an in-memory quantized VLA model, processor, and related components
++    and provides the interface expected by SimplerEnv's evaluation loop.
++    """
++
++    def __init__(
++        self,
++        vla,
++        processor,
++        cfg,
++        action_head=None,
++        proprio_projector=None,
++        policy_setup: str = "google_robot",
++        action_scale: float = 1.0,
++        chunk_size: int = NUM_ACTIONS_CHUNK,
++    ):
++        """
++        Args:
++            vla: Quantized VLA model (in-memory object, not checkpoint path)
++            processor: VLA processor for image/language preprocessing
++            cfg: GenerateConfig with model settings (num_images, use_proprio, unnorm_key, etc.)
++            action_head: Optional action head (for diffusion-based policies)
++            proprio_projector: Optional proprioceptive projector
++            policy_setup: One of "google_robot" or "widowx_bridge"
++            action_scale: Scale factor for actions
++            chunk_size: Number of action steps per prediction chunk
++        """
++        self.vla = vla
++        self.processor = processor
++        self.cfg = cfg
++        self.action_head = action_head
++        self.proprio_projector = proprio_projector
++        self.policy_setup = policy_setup
++        self.action_scale = action_scale
++        self.chunk_size = chunk_size
++
++        if policy_setup == "google_robot":
++            self.sticky_gripper_num_repeat = 15
++        elif policy_setup == "widowx_bridge":
++            self.sticky_gripper_num_repeat = 1
++        else:
++            raise NotImplementedError(f"Policy setup {policy_setup} not supported")
++
++        self.task_description = None
++        self.action_deque = deque(maxlen=self.chunk_size)
++        self.sticky_action_is_on = False
++        self.gripper_action_repeat = 0
++        self.sticky_gripper_action = 0.0
++        self.previous_gripper_action = None
++        self.device = "cuda" if torch.cuda.is_available() else "cpu"
++        self._warned_missing_aux_views = False
++        self._warned_missing_openvla_preprocess = False
++        self._warned_missing_proprio_preprocess = False
++
++        # Detect base model (no OFT action head) → use autoregressive generation
++        self._is_base_model = (
++            action_head is None
++            and not getattr(cfg, "use_l1_regression", False)
++            and not getattr(cfg, "use_diffusion", False)
++        )
++        if self._is_base_model:
++            print(
++                "[OpenVLAQuantizedInference] Base model detected (no action_head): "
++                "using predict_action() discrete path (reference-compatible)"
++            )
++
++    def reset(self, task_description: str) -> None:
++        self.task_description = task_description
++        self.action_deque.clear()
++        self.sticky_action_is_on = False
++        self.gripper_action_repeat = 0
++        self.sticky_gripper_action = 0.0
++        self.previous_gripper_action = None
++
++    @staticmethod
++    def _extract_proprio_from_obs(obs: Any) -> Optional[np.ndarray]:
++        if not isinstance(obs, dict):
++            return None
++
++        state = obs.get("state")
++        if isinstance(state, np.ndarray):
++            return state
++
++        agent_state = obs.get("agent")
++        if isinstance(agent_state, dict):
++            if isinstance(agent_state.get("state"), np.ndarray):
++                return agent_state["state"]
++            qpos = agent_state.get("qpos")
++            qvel = agent_state.get("qvel")
++            if isinstance(qpos, np.ndarray) and isinstance(qvel, np.ndarray):
++                return np.concatenate([qpos, qvel], axis=-1)
++            if isinstance(qpos, np.ndarray):
++                return qpos
++
++        for key in ("proprio", "proprioception"):
++            val = obs.get(key)
++            if isinstance(val, np.ndarray):
++                return val
++        return None
++
++    def _prepare_images_for_vla(self, images: Sequence[np.ndarray]) -> Sequence[Image.Image]:
++        preprocess_fns = _get_openvla_preprocess_fns()
++        if preprocess_fns is not None:
++            return list(preprocess_fns["prepare_images_for_vla"](list(images), self.cfg))
++        if not self._warned_missing_openvla_preprocess:
++            warnings.warn(
++                "OpenVLA preprocessing utilities are unavailable; using fallback PIL conversion only."
++            )
++            self._warned_missing_openvla_preprocess = True
++        return _fallback_prepare_images_for_vla(images)
++
++    def _normalize_proprio(self, proprio: np.ndarray) -> np.ndarray:
++        preprocess_fns = _get_openvla_preprocess_fns()
++        if preprocess_fns is None:
++            if not self._warned_missing_proprio_preprocess:
++                warnings.warn(
++                    "OpenVLA proprio preprocessing utilities are unavailable; passing raw proprio as-is."
++                )
++                self._warned_missing_proprio_preprocess = True
++            return np.asarray(proprio, dtype=np.float32)
++
++        proprio_norm_stats = self.vla.norm_stats[self.cfg.unnorm_key]["proprio"]
++        return preprocess_fns["normalize_proprio"](np.asarray(proprio, dtype=np.float32), proprio_norm_stats)
++
++    def _set_num_images_in_input(self, num_images: int) -> None:
++        if num_images <= 0:
++            raise ValueError(f"num_images_in_input must be positive, got {num_images}")
++
++        vision_backbone = getattr(self.vla, "vision_backbone", None)
++        if vision_backbone is None:
++            return
++        set_num_images = getattr(vision_backbone, "set_num_images_in_input", None)
++        get_num_images = getattr(vision_backbone, "get_num_images_in_input", None)
++        if not callable(set_num_images):
++            return
++
++        current_num_images = None
++        if callable(get_num_images):
++            try:
++                current_num_images = int(get_num_images())
++            except Exception:
++                current_num_images = None
++        if current_num_images != num_images:
++            set_num_images(num_images)
++
++    def _collect_policy_images(
++        self,
++        primary_image: np.ndarray,
++        obs: Optional[dict] = None,
++        obs_camera_name: Optional[str] = None,
++    ) -> Sequence[np.ndarray]:
++        expected_num_images = max(int(getattr(self.cfg, "num_images_in_input", 1)), 1)
++        images = [primary_image]
++        if expected_num_images == 1:
++            return images
++
++        if isinstance(obs, dict):
++            obs_image_dict = obs.get("image")
++            if isinstance(obs_image_dict, dict):
++                preferred_aux, fallback_aux = [], []
++                for camera_name, camera_obs in obs_image_dict.items():
++                    if obs_camera_name is not None and camera_name == obs_camera_name:
++                        continue
++                    if not isinstance(camera_obs, dict):
++                        continue
++                    rgb = camera_obs.get("rgb")
++                    if not isinstance(rgb, np.ndarray):
++                        continue
++                    if rgb.shape == primary_image.shape and np.array_equal(rgb, primary_image):
++                        continue
++                    camera_name_l = str(camera_name).lower()
++                    if any(tag in camera_name_l for tag in ("wrist", "hand", "gripper")):
++                        preferred_aux.append(rgb)
++                    else:
++                        fallback_aux.append(rgb)
++                for rgb in preferred_aux + fallback_aux:
++                    if len(images) >= expected_num_images:
++                        break
++                    images.append(rgb)
++
++        if len(images) < expected_num_images and not self._warned_missing_aux_views:
++            warnings.warn(
++                f"Expected {expected_num_images} policy image views, but only found {len(images)}. "
++                "Proceeding with available views and adapting model input image count dynamically."
++            )
++            self._warned_missing_aux_views = True
++        return images
++
++    def step(
++        self,
++        image: np.ndarray,
++        task_description: Optional[str] = None,
++        *args,
++        **kwargs
++    ) -> tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
++        if task_description is not None and task_description != self.task_description:
++            self.reset(task_description)
++
++        if len(self.action_deque) == 0:
++            self._generate_action_chunk(image, **kwargs)
++
++        raw_action = self.action_deque.popleft()
++        action = self._process_action(raw_action)
++        return raw_action, action
++
++    def _generate_action_chunk(self, image: np.ndarray, proprio: Optional[np.ndarray] = None, **kwargs) -> None:
++        if self.task_description is None:
++            raise RuntimeError("task_description must be set before calling step()")
++
++        with torch.inference_mode():
++            obs = kwargs.get("obs")
++            obs_camera_name = kwargs.get("obs_camera_name")
++            policy_images = self._collect_policy_images(
++                primary_image=image,
++                obs=obs,
++                obs_camera_name=obs_camera_name,
++            )
++            pil_images = list(self._prepare_images_for_vla(policy_images))
++            self._set_num_images_in_input(len(pil_images))
++
++            # Use official OpenVLA prompt format (matches training distribution).
++            prompt = f"In: What action should the robot take to {self.task_description}?\nOut:"
++            inputs = self.processor(prompt, pil_images[0], return_tensors="pt")
++
++            if len(pil_images) > 1:
++                extra_inputs = [
++                    self.processor(prompt, extra_image, return_tensors="pt")
++                    for extra_image in pil_images[1:]
++                ]
++                inputs["pixel_values"] = torch.cat(
++                    [inputs["pixel_values"]] + [extra["pixel_values"] for extra in extra_inputs],
++                    dim=1,
++                )
++
++            if "pixel_values" in inputs:
++                inputs["pixel_values"] = inputs["pixel_values"].to(self.device, dtype=torch.bfloat16)
++            if "input_ids" in inputs:
++                inputs["input_ids"] = inputs["input_ids"].to(self.device)
++            if "attention_mask" in inputs:
++                inputs["attention_mask"] = inputs["attention_mask"].to(self.device)
++            if "token_type_ids" in inputs:
++                inputs["token_type_ids"] = inputs["token_type_ids"].to(self.device)
++
++            proprio_input = proprio
++            if self.cfg.use_proprio:
++                if proprio_input is None:
++                    proprio_input = self._extract_proprio_from_obs(obs)
++                if proprio_input is not None:
++                    proprio_input = self._normalize_proprio(proprio_input)
++                    if not isinstance(proprio_input, torch.Tensor):
++                        proprio_input = torch.from_numpy(np.asarray(proprio_input, dtype=np.float32)).to(self.device)
++                    else:
++                        proprio_input = proprio_input.to(self.device)
++
++            # CRITICAL FIX: predict_action() appends token 29871 to input_ids,
++            # but the processor-provided attention_mask is NOT extended, causing
++            # a shape mismatch. Let generate() create the correct one.
++            inputs.pop("attention_mask", None)
++
++            # Align with reference implementation path:
++            # always prefer OpenVLA's predict_action() API.
++            if self._is_base_model:
++                pred = self.vla.predict_action(
++                    **inputs,
++                    unnorm_key=self.cfg.unnorm_key,
++                    do_sample=False,
++                )
++                action_chunk = pred[0] if isinstance(pred, tuple) else pred
++            else:
++                pred = self.vla.predict_action(
++                    **inputs,
++                    unnorm_key=self.cfg.unnorm_key,
++                    do_sample=False,
++                    proprio=proprio_input,
++                    proprio_projector=self.proprio_projector if self.cfg.use_proprio else None,
++                    action_head=self.action_head,
++                )
++                action_chunk = pred[0] if isinstance(pred, tuple) else pred
++
++        if isinstance(action_chunk, torch.Tensor):
++            action_chunk = action_chunk.detach().cpu().numpy()
++
++        action_chunk = np.asarray(action_chunk)
++        if action_chunk.ndim == 1:
++            action_chunk = action_chunk[None, :]
++
++        if not hasattr(self, '_dbg_cnt'):
++            self._dbg_cnt = 0
++        if self._dbg_cnt < 5:
++            print(f"[DBG] step {self._dbg_cnt} raw_actions={action_chunk[0]} prompt={prompt[:60]}...")
++            self._dbg_cnt += 1
++
++        for t in range(action_chunk.shape[0]):
++            action_t = {
++                "world_vector": action_chunk[t, :3].astype(np.float32),
++                "rotation_delta": action_chunk[t, 3:6].astype(np.float32),
++                "open_gripper": action_chunk[t, 6:7].astype(np.float32),
++            }
++            self.action_deque.append(action_t)
++
++    def _process_action(self, raw_action: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
++        action = {}
++        action["world_vector"] = raw_action["world_vector"] * self.action_scale
++
++        action_rotation_delta = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
++        roll, pitch, yaw = action_rotation_delta
++        action_rotation_ax, action_rotation_angle = euler2axangle(roll, pitch, yaw)
++        action["rot_axangle"] = (action_rotation_ax * action_rotation_angle) * self.action_scale
++
++        if self.policy_setup == "google_robot":
++            current_gripper_action = raw_action["open_gripper"][0]
++            if self.previous_gripper_action is None:
++                relative_gripper_action = 0.0
++            else:
++                relative_gripper_action = float(self.previous_gripper_action) - float(current_gripper_action)
++
++            self.previous_gripper_action = float(current_gripper_action)
++
++            if np.abs(relative_gripper_action) > 0.5 and not self.sticky_action_is_on:
++                self.sticky_action_is_on = True
++                self.sticky_gripper_action = relative_gripper_action
++
++            if self.sticky_action_is_on:
++                self.gripper_action_repeat += 1
++                relative_gripper_action = float(self.sticky_gripper_action)
++
++            if self.gripper_action_repeat == self.sticky_gripper_num_repeat:
++                self.sticky_action_is_on = False
++                self.gripper_action_repeat = 0
++                self.sticky_gripper_action = 0.0
++
++            action["gripper"] = np.asarray([relative_gripper_action], dtype=np.float32)
++        elif self.policy_setup == "widowx_bridge":
++            action["gripper"] = np.asarray([2.0 * (raw_action["open_gripper"][0] > 0.5) - 1.0], dtype=np.float32)
++
++        action["terminate_episode"] = np.array([0.0])
++        return action
++
++    def visualize_epoch(
++        self,
++        predicted_actions: Sequence[Dict],
++        images: Sequence[np.ndarray],
++        save_path: Optional[str] = None,
++    ) -> None:
++        if save_path is None:
++            return
++
++        import os
++
++        os.makedirs(os.path.dirname(save_path), exist_ok=True)
++
++        if len(predicted_actions) == 0:
++            plt.figure(figsize=(6, 3))
++            plt.title("No predicted actions")
++            plt.savefig(save_path)
++            plt.close()
++            return
++
++        action_labels = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
++        action_series = []
++        for action in predicted_actions:
++            action_series.append(
++                np.concatenate([action["world_vector"], action["rotation_delta"], action["open_gripper"]], axis=-1)
++            )
++        action_series = np.asarray(action_series)
++
++        fig, axs = plt.subplots(2, 4, figsize=(20, 8))
++        axs = axs.flatten()
++
++        # Show a subsampled observation strip for quick qualitative debugging.
++        sampled_images = list(images[:: max(1, len(images) // 24)])
++        if len(sampled_images) > 0:
++            strip = np.concatenate(sampled_images, axis=1)
++            axs[0].imshow(strip)
++        axs[0].set_title("observations")
++        axs[0].axis("off")
++
++        for i, label in enumerate(action_labels):
++            axs[i + 1].plot(action_series[:, i], label=label)
++            axs[i + 1].set_title(label)
++            axs[i + 1].set_xlabel("timestep")
++            axs[i + 1].grid(alpha=0.3)
++
++        fig.tight_layout()
++        fig.savefig(save_path)
++        plt.close(fig)

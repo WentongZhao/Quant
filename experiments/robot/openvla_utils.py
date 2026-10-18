@@ -183,7 +183,8 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     # Find current files
     curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
 
-    for root, _, files in os.walk("./prismatic/"):
+    source_root = Path(__file__).resolve().parents[2] / "prismatic"
+    for root, _, files in os.walk(source_root):
         for filename in curr_files.keys():
             if filename in files and curr_files[filename] is None:
                 curr_files[filename] = os.path.join(root, filename)
@@ -281,13 +282,18 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
-        # attn_implementation="flash_attention_2",
+        # OFT parallel action decoding requires the bidirectional attention
+        # implemented in the moojink Transformers fork's SDPA branch.
+        # Stock Flash Attention 2 uses causal=True and changes policy outputs.
+        attn_implementation="sdpa",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+
+    print(f"Attention implementation: {vla.language_model.config._attn_implementation}")
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
